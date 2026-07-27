@@ -1,0 +1,12 @@
+# Adds a tls block to every Ingress in the build (both of ours serve the same
+# host, so both terminate with the same secret).
+#
+# The host is a placeholder — the replacement in kustomization.yaml overwrites
+# it with INVENTORY_DOMAIN. It can't be left empty: kustomize needs the field to
+# exist before it can replace into it.
+- op: add
+  path: /spec/tls
+  value:
+    - hosts:
+        - INVENTORY_DOMAIN
+      secretName: inventory-ssl

@@ -1,37 +1,17 @@
+# Compatibility shim for the panel's ./custom.sh, which builds a directory
+# root and so needs a kustomization here.
+#
+# Copy this whole k8s/ directory to 5stack-panel/custom/inventory/ and run
+# `./custom.sh inventory` — the dir name matters, custom.sh derives the node
+# label as `5stack-<dirname>` and the deployments pin to `5stack-inventory`.
+#
+# It defaults to the plain-HTTP install. If your panel terminates TLS at the
+# cluster (REVERSE_PROXY=false), point this at overlays/https instead.
+#
+# ../install.sh doesn't use this file — it builds the overlay it picked
+# directly, and picks it by reading the panel's REVERSE_PROXY for you.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: 5stack
-
 resources:
-  - deployment.yaml
-  - service.yaml
-  - ingress.yaml
-
-configMapGenerator:
-  - name: inventory-config
-    envs:
-      - inventory.env
-
-secretGenerator:
-  - name: inventory-secrets
-    type: Opaque
-    envs:
-      - inventory-secrets.env
-
-replacements:
-  - source:
-      kind: ConfigMap
-      name: inventory-config
-      fieldPath: data.INVENTORY_DOMAIN
-    targets:
-      - select:
-          kind: Ingress
-          name: inventory-api
-        fieldPaths:
-          - spec.rules.0.host
-      - select:
-          kind: Ingress
-          name: inventory-frontend
-        fieldPaths:
-          - spec.rules.0.host
+  - overlays/http

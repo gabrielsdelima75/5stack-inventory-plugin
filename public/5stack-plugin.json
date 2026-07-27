@@ -8,5 +8,24 @@
   "module": "./App",
   "requiredRole": "verified_user",
   "profileTabLabel": "Inventory",
-  "deployments": ["inventory-frontend", "inventory-backend"]
+  "deployments": ["inventory-frontend", "inventory-backend"],
+  "install": {
+    "overlays": {
+      "http": "k8s/overlays/http",
+      "https": "k8s/overlays/https"
+    },
+    "certificate": "inventory-ssl",
+    "domain": {
+      "prefix": "inventory",
+      "var": "INVENTORY_DOMAIN",
+      "file": "k8s/base/inventory.env"
+    },
+    "database": {
+      "var": "DATABASE_URL",
+      "file": "k8s/base/inventory-secrets.env"
+    },
+    "node": {
+      "label": "5stack-inventory"
+    }
+  }
 }

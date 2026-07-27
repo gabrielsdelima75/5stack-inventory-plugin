@@ -9,6 +9,11 @@
 # cookie to present.
 # CORS is handled by the apps themselves (backend: @fastify/cors; frontend:
 # nginx add_header) — not here.
+#
+# No `tls:` here on purpose. The base IS the plain-HTTP install, for sites whose
+# certificate is terminated upstream (Cloudflare proxy/tunnel or any reverse
+# proxy — the panel's REVERSE_PROXY=true). The cert-manager install adds the tls
+# blocks by patch instead; see ../overlays/https.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

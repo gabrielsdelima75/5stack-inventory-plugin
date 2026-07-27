@@ -39,7 +39,8 @@ cookie ──▶ /plugins/authorize ──▶ identity   validates the session i
 | `shared-globals.ts` | resolves `vue` to the panel's instance (replaces Federation `shared`) |
 | `backend/src/catalog.ts` | CS2 item catalog via `@ianlucas/cs2-lib` |
 | `backend/` | Fastify API + `inventory` Postgres schema |
-| `k8s/` | kustomize package to drop into `5stack-panel/custom/inventory` |
+| `k8s/` | kustomize package — `base/` plus an `http` and an `https` overlay |
+| `public/5stack-plugin.json` | the manifest: what the panel registers, and its `install` block |
 | `codepier.yaml` | live-sync the backend into its pod for dev |
 
 ## Plugin routes (the routing contract)
@@ -260,7 +261,31 @@ does the build-watch + serve in one command.
 > Pin `vue`, `reka-ui`, `pinia`, `@5stack/ui` to the **same versions** the panel
 > (`web`) uses, or Federation loads a second copy and reactivity breaks.
 
-## Deploying to an existing 5stack site
+## Installing on an existing 5stack site
+
+From your `5stack-panel` checkout:
+
+```bash
+./plugin.sh https://github.com/lukepolo/5stack-inventory-plugin
+```
+
+That's it. The panel already knows this site, so the installer reads rather than
+asks: the kubeconfig, your `WEB_DOMAIN` (the host defaults to
+`inventory.<your domain>`), the Postgres connection string copied out of the
+cluster, and — from `REVERSE_PROXY` — **which of the two installs below you
+need**. Then it labels a node, applies, and tells you what's left (DNS, cert,
+registration). Re-run it to upgrade; your answers are kept.
+
+| | |
+| --- | --- |
+| `k8s/overlays/http` | TLS terminated in front of the cluster — Cloudflare proxy/tunnel or any reverse proxy. No certificate. |
+| `k8s/overlays/https` | TLS terminated at the cluster's nginx. Adds a cert-manager `Certificate` for the plugin's host, issued by the panel's `5stack-issuer`. |
+
+`public/5stack-plugin.json` is what drives it — its `install` block names those
+two overlays and the values the installer fills in. The format is at
+[docs.5stack.gg/plugins/installing](https://docs.5stack.gg/plugins/installing).
+
+### By hand
 
 1. **Build & push** both images:
    ```bash
@@ -269,8 +294,12 @@ does the build-watch + serve in one command.
    docker push ghcr.io/lukepolo/5stack-inventory-plugin-frontend:latest
    docker push ghcr.io/lukepolo/5stack-inventory-plugin-backend:latest
    ```
-2. **Drop `k8s/` into the panel** at `5stack-panel/custom/inventory/`.
-3. **Configure**:
+2. **Drop `k8s/` into the panel** at `5stack-panel/custom/inventory/`. The
+   directory name matters: `custom.sh` derives the node label as
+   `5stack-<dirname>`, and the deployments pin to `5stack-inventory`.
+   `k8s/kustomization.yaml` defaults to the HTTP install — point it at
+   `overlays/https` if your panel terminates TLS at the cluster.
+3. **Configure** (both files live in `k8s/base/`):
    - `inventory.env` → `INVENTORY_DOMAIN` (e.g. `inventory.yoursite.gg`) and
      `CORS_ALLOW_ORIGIN` (your panel origin, e.g. `https://yoursite.gg`).
    - `inventory-secrets.env` (copy from `inventory-secrets.env.example`) →

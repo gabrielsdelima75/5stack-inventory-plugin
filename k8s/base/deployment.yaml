@@ -21,15 +21,15 @@ spec:
       labels:
         app: inventory-frontend
     spec:
-      # The hostPath below only exists on the node custom.sh labeled for this
-      # custom dir. Without this the surge pod can schedule elsewhere and come
-      # up with an empty models mount.
+      # The hostPath below only exists on the node install.sh labeled
+      # `5stack-inventory=true`. Without this the surge pod can schedule
+      # elsewhere and come up with an empty models mount.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: 5stack-5stack-inventory
+                  - key: 5stack-inventory
                     operator: In
                     values:
                       - "true"
@@ -108,13 +108,13 @@ spec:
         app: inventory-backend
     spec:
       # Both hostPaths (models mount, CS2 install) are node-local — pin to the
-      # node custom.sh labeled for this custom dir.
+      # node install.sh labeled `5stack-inventory=true`.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: 5stack-5stack-inventory
+                  - key: 5stack-inventory
                     operator: In
                     values:
                       - "true"

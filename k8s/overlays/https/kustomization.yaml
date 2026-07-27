@@ -1,0 +1,46 @@
+# cert-manager install — the plugin gets its own Let's Encrypt certificate.
+#
+# For sites that terminate TLS at the cluster's nginx ingress, i.e. the panel's
+# REVERSE_PROXY=false. install.sh picks this overlay automatically when it reads
+# that out of the panel's .5stack-env.config.
+#
+# Requires cert-manager and an Issuer to already exist — the panel install
+# creates both (Issuer/5stack-issuer in the 5stack namespace) when it is set up
+# for https. See certificate.yaml if yours is named something else.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - certificate.yaml
+
+patches:
+  - path: ingress-tls-patch.yaml
+    target:
+      kind: Ingress
+
+replacements:
+  # The base already points the ingress *rules* at INVENTORY_DOMAIN. These are
+  # the two fields only this overlay has: the SNI host on the tls block, and the
+  # SAN on the cert. Same source value, so the certificate can never end up
+  # covering a different host than the one being routed.
+  - source:
+      kind: ConfigMap
+      name: inventory-config
+      fieldPath: data.INVENTORY_DOMAIN
+    targets:
+      - select:
+          kind: Ingress
+          name: inventory-api
+        fieldPaths:
+          - spec.tls.0.hosts.0
+      - select:
+          kind: Ingress
+          name: inventory-frontend
+        fieldPaths:
+          - spec.tls.0.hosts.0
+      - select:
+          kind: Certificate
+          name: inventory-ssl
+        fieldPaths:
+          - spec.dnsNames.0
