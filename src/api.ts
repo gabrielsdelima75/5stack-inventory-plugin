@@ -380,12 +380,87 @@ export const fetchLoadout = () => request<LoadoutEntry[]>("/loadout");
 // ---- Inventory (owned instances) ----
 export const fetchInventory = () => request<InventoryItem[]>("/inventory");
 
-export const searchStickers = (q: string) =>
-  request<Skin[]>(`/catalog/stickers?q=${encodeURIComponent(q)}`);
-export const searchCharms = (q: string) =>
-  request<Skin[]>(`/catalog/charms?q=${encodeURIComponent(q)}`);
-export const searchPatches = (q: string) =>
-  request<Skin[]>(`/catalog/patches?q=${encodeURIComponent(q)}`);
+export type AttachKind = "sticker" | "charm" | "patch";
+
+/** One value of a picker facet, with how many items carry it. */
+export interface AttachFacet {
+  value: string;
+  /** Absent on rarity facets — those are hex colours the UI names itself. */
+  label?: string;
+  count: number;
+}
+/**
+ * One page of an attachment search, plus the facets to draw the filter bar.
+ *
+ * `total` counts every match, not this page, so the picker knows whether
+ * scrolling further will find anything. Each facet list is counted with the
+ * filters ABOVE it applied and its own ignored (group → collection → rarity), so
+ * switching between values within one facet is always possible.
+ */
+export interface AttachPage {
+  items: Skin[];
+  total: number;
+  /** Matches for the text query ALONE — what the "All" tab counts. Not derivable
+   *  from `groups`: "Logos & Art" is a union of two of the others, so summing
+   *  them double-counts. */
+  queryTotal: number;
+  /** Sub-kind: Logos & Art / Signatures / Team Logos / Community, or Charms /
+   *  Sticker Slabs. Tab order as shown; "All" is the UI's own, and goes last. */
+  groups: AttachFacet[];
+  /** Capsule or collection the item came in. */
+  collections: AttachFacet[];
+  rarities: AttachFacet[];
+}
+/** Server-side, because the grid only holds the pages it has scrolled through —
+ *  sorting those alone would leave the rest arriving in catalog order beneath. */
+export type AttachSort = "default" | "rarity" | "name";
+export type AttachDir = "asc" | "desc";
+export interface AttachFilters {
+  q?: string;
+  group?: string;
+  collection?: string;
+  rarity?: string;
+  sort?: AttachSort;
+  dir?: AttachDir;
+  offset?: number;
+  limit?: number;
+}
+// Stickers and charms are ~10.5k items each — searched, faceted and paged
+// server-side, and scrolled through rather than truncated. `offset` is simply how
+// many are already on screen.
+const ATTACH_PATH: Record<AttachKind, string> = { sticker: "stickers", charm: "charms", patch: "patches" };
+export async function searchAttachments(kind: AttachKind, filters: AttachFilters = {}): Promise<AttachPage> {
+  const query = new URLSearchParams({
+    q: filters.q ?? "",
+    group: filters.group ?? "",
+    collection: filters.collection ?? "",
+    rarity: filters.rarity ?? "",
+    sort: filters.sort ?? "default",
+    dir: filters.dir ?? "",
+    offset: String(filters.offset ?? 0),
+    limit: String(filters.limit ?? 120),
+  });
+  // Normalised HERE, at the boundary, so callers can treat every field as
+  // present. The frontend and backend ship as SEPARATE images, so a bundle that
+  // knows about paging and facets can and does run for a while against an API
+  // that doesn't — and this endpoint has had three shapes: a bare array, then
+  // {items,total}, now facets too. Trusting the newest shape crashed the picker
+  // on `undefined.length` mid-render instead of simply hiding the filter bar.
+  const body = await request<Partial<AttachPage> | Skin[]>(`/catalog/${ATTACH_PATH[kind]}?${query}`);
+  if (Array.isArray(body)) {
+    return { items: body, total: body.length, queryTotal: body.length, groups: [], collections: [], rarities: [] };
+  }
+  const items = body.items ?? [];
+  const total = body.total ?? items.length;
+  return {
+    items,
+    total,
+    queryTotal: body.queryTotal ?? total,
+    groups: body.groups ?? [],
+    collections: body.collections ?? [],
+    rarities: body.rarities ?? [],
+  };
+}
 
 // Resolve catalog items by id — how a shared /craft link turns the ids in its
 // query back into a renderable draft. Returns only the ids that exist, so a

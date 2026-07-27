@@ -702,6 +702,14 @@ export interface ViewerHandle {
   setCharm: (charm: CharmPlacement | null) => void;
   /** Attach/detach the StatTrak module without remounting (keeps the camera). */
   setStatTrak: (spec: { count: number | null } | null) => void;
+  /**
+   * Turn placement gestures on/off on a LIVE viewer — see ViewerOpts.interactive
+   * for what they are. The craft modal shows one item in two modes (view and
+   * edit) and flips between them without remounting, so `interactive` cannot be
+   * a mount-time constant: off it also means "idle-spin the model", which is
+   * exactly wrong for an editor.
+   */
+  setInteractive: (on: boolean) => void;
   snapshot: () => Promise<Blob | null>;
   /** True when the paint composited on fallbacks because a texture it names is
    *  not on the mount yet (an extraction is still running). What's on screen is
@@ -750,6 +758,7 @@ export interface ViewerOpts {
    *  the old silhouette guess, which does NOT match the game. */
   stickerSlots?: StickerSlot[];
   // Interactive placement: drag stickers across the surface, grab the charm.
+  // INITIAL value only — flip it later with handle.setInteractive().
   interactive?: boolean;
   onStickerPlaced?: (slot: number, x: number, y: number) => void;
   /** Shift-drag on a sticker — degrees, 0-360. */
@@ -1230,11 +1239,17 @@ async function buildViewer(
     camera.lookAt(0, 0, 0);
   }
 
+  // Placement mode, MUTABLE — see setInteractive() on the handle. `opts` only
+  // seeds it: view mode and edit mode are the same mounted viewer (the modal
+  // flips between them without a remount, deliberately), so every gate below
+  // has to read a live flag rather than the option it was mounted with.
+  let placeable = !!opts?.interactive;
+
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   // Spinning while trying to drag a sticker is misery — static in editors.
-  controls.autoRotate = !opts?.interactive && !opts?.still;
+  controls.autoRotate = !placeable && !opts?.still;
   controls.autoRotateSpeed = 0.9;
   // Pan (right-drag / two-finger drag) + a closer zoom floor: precision work
   // on touch is done by zooming INTO the spot and panning it under your
@@ -1663,6 +1678,9 @@ async function buildViewer(
     applyStickerWear(mat, st.w ?? 0);
     const mesh = new THREE.Mesh(geom, mat);
     mesh.userData.stickerSlot = st.slot;
+    // Anchor point and facing, kept for the near-miss grab test — see pickSticker.
+    mesh.userData.stickerCenter = hit.point.clone();
+    mesh.userData.stickerNormal = hit.normal.clone();
     mesh.renderOrder = 10 + st.slot;
     scene.add(mesh);
     liveMesh.set(st.slot, mesh);
@@ -2309,8 +2327,45 @@ async function buildViewer(
     pointerNdc.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
   }
 
+  /**
+   * Which sticker a press at the current pointer would grab, or null.
+   *
+   * Exact raycast FIRST, then a small pixel-radius fallback around each decal's
+   * anchor. The fallback exists because a decal is not the clean quad it looks
+   * like: it is the weapon's own triangles clipped to the projection box, minus
+   * the ones cullGlancingDecalTris drops, lifted off the surface. On a detailed
+   * body that leaves real holes, so a press a few pixels from where you aimed
+   * missed the mesh, fell through to OrbitControls, and spun the weapon — the
+   * "sometimes I can't drag the sticker" report. Slop makes the hit match the
+   * sticker you can SEE rather than the triangles that survived clipping.
+   *
+   * Back-facing decals are skipped, so a sticker on the far side of the weapon
+   * is never grabbed through the body — the exact raycast can't do that either,
+   * and a hover that lies is worse than no hover.
+   */
+  const GRAB_SLOP_PX = 22;
+  function pickSticker(): number | null {
+    const exact = raycaster.intersectObjects([...liveMesh.values()], false)[0];
+    if (exact) return (exact.object.userData.stickerSlot as number) ?? 0;
+    const halfW = (el.clientWidth || 1) * 0.5;
+    const halfH = (el.clientHeight || 1) * 0.5;
+    const ndc = new THREE.Vector3();
+    const toCam = new THREE.Vector3();
+    let best: { slot: number; d: number } | null = null;
+    for (const [slot, mesh] of liveMesh) {
+      const center = mesh.userData.stickerCenter as import("three").Vector3 | undefined;
+      const normal = mesh.userData.stickerNormal as import("three").Vector3 | undefined;
+      if (!center || !normal) continue;
+      if (normal.dot(toCam.copy(camera.position).sub(center)) <= 0) continue; // facing away
+      ndc.copy(center).project(camera);
+      const d = Math.hypot((ndc.x - pointerNdc.x) * halfW, (ndc.y - pointerNdc.y) * halfH);
+      if (d <= GRAB_SLOP_PX && (!best || d < best.d)) best = { slot, d };
+    }
+    return best?.slot ?? null;
+  }
+
   function onPointerDown(e: PointerEvent) {
-    if (!opts?.interactive || e.button !== 0) return;
+    if (!placeable || e.button !== 0) return;
     updatePointer(e);
     raycaster.setFromCamera(pointerNdc, camera);
     if (charm) {
@@ -2327,10 +2382,9 @@ async function buildViewer(
         return;
       }
     }
-    const decalMeshes = [...liveMesh.values()];
-    const hit = raycaster.intersectObjects(decalMeshes, false)[0];
-    if (hit) {
-      drag = { type: "sticker", slot: (hit.object.userData.stickerSlot as number) ?? 0 };
+    const slot = pickSticker();
+    if (slot != null) {
+      drag = { type: "sticker", slot };
       // Shift turns the same drag into a rotate — no extra handle to hit, and
       // it can be decided mid-gesture. Anchor the sweep where the press landed.
       rotateAnchorX = e.clientX;
@@ -2531,7 +2585,7 @@ async function buildViewer(
     }
     // Nothing is grabbable without placement, so skip the raycast entirely —
     // a view-only viewer never leaves the orbit/pan/zoom states.
-    if (!opts?.interactive) {
+    if (!placeable) {
       paintCursor();
       return;
     }
@@ -2543,10 +2597,12 @@ async function buildViewer(
       if (disposed || drag) return;
       updatePointer(e);
       raycaster.setFromCamera(pointerNdc, camera);
+      // Same test the press uses, slop included — the reticle must promise
+      // exactly what a click would grab.
       hoverKind =
         charm && raycaster.intersectObject(charm.sprite, false)[0]
           ? "charm"
-          : raycaster.intersectObjects([...liveMesh.values()], false)[0]
+          : pickSticker() != null
             ? "sticker"
             : null;
       paintCursor();
@@ -2579,7 +2635,13 @@ async function buildViewer(
     paintCursor();
   }
 
-  if (opts?.interactive) {
+  // Bound for every on-screen viewer, not just the ones that MOUNT in placement
+  // mode: the handlers gate themselves on `placeable`, and binding lazily meant a
+  // viewer that entered edit mode after mounting (View → Edit is a flag flip, not
+  // a remount) had no drag listeners at all — the press fell through to
+  // OrbitControls and spun the weapon instead of picking the sticker up.
+  // `still` viewers are offscreen snapshot rigs with no pointer to listen to.
+  if (!opts?.still) {
     el.addEventListener("pointerdown", onPointerDown);
     el.addEventListener("pointermove", onPointerMove);
     el.addEventListener("pointerup", onPointerUp);
@@ -3000,6 +3062,25 @@ async function buildViewer(
     setStickers,
     flashSticker,
     setCharm: (c) => void setCharm(c),
+    setInteractive(on) {
+      if (placeable === on) return;
+      placeable = on;
+      // The whole point of the flip: an editor must never idle-spin under a
+      // sticker someone is trying to aim.
+      controls.autoRotate = !on && !opts?.still;
+      if (!on) {
+        // Leaving placement mode mid-gesture would strand a held sticker and a
+        // disabled OrbitControls. Let go of everything first.
+        if (drag) {
+          if (drag.type === "charm" && charm) charm.sprite.scale.set(charm.w, charm.h, 1);
+          drag = null;
+          charmDragging = false;
+          controls.enabled = true;
+        }
+        hoverKind = null;
+      }
+      paintCursor();
+    },
     // Reports the REAL measured placement frame — same reasoning as `lighting`
     // above. Charm offsets ship to the game as absolute Source inches, so a
     // wrong unit scale is invisible in preview (offsetToWorld and worldToOffset
@@ -3138,7 +3219,7 @@ async function buildViewer(
       cancelAnimationFrame(raf);
       observer.disconnect();
       renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
-      if (opts?.interactive) {
+      if (!opts?.still) {
         el.removeEventListener("pointerdown", onPointerDown);
         el.removeEventListener("pointermove", onPointerMove);
         el.removeEventListener("pointerup", onPointerUp);

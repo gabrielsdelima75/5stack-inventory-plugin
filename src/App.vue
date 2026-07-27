@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch, provide } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch, provide, type ComputedRef } from "vue";
 import { cn } from "@5stack/ui";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
@@ -9,9 +9,9 @@ import {
 import {
   fetchCatalog,
   fetchSkins,
-  searchStickers,
-  searchCharms,
-  searchPatches,
+  searchAttachments,
+  type AttachFacet,
+  type AttachSort,
   fetchCatalogItems,
   fetchLoadout,
   fetchInventory,
@@ -68,6 +68,9 @@ import WearBar from "./WearBar.vue";
 import ItemTile from "./ItemTile.vue";
 import TileActions from "./TileActions.vue";
 import FilterDropdown from "./FilterDropdown.vue";
+import InfiniteSentinel from "./InfiniteSentinel.vue";
+import SortDirection from "./SortDirection.vue";
+import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
 import { attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, wearTier } from "./itemVisuals";
 import { isCompact, isCoarse } from "./responsive";
 import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
@@ -614,23 +617,113 @@ const rarityRank = (hex?: string | null) => (hex && RARITY_META[hex.toLowerCase(
 // Rarity, not insertion order: an inventory reads better with the covert reds
 // at the top than with whatever you happened to craft last.
 const DEFAULT_SORT: SortMode = "rarity";
+
+/**
+ * Sort direction. Every sorted grid has one and SHOWS it — an unlabelled "Sort ·
+ * Rarity" doesn't say which end it starts from, and for wear the two ends mean
+ * opposite things (a factory-new hunt vs a battle-scarred one).
+ *
+ * Each mode has a NATURAL direction: the one you meant when you picked it. The
+ * comparators below are written in that direction, and a flip negates the primary
+ * key only — the name tiebreak stays A→Z either way, so reversing rarity doesn't
+ * silently reverse the names inside each tier too.
+ */
+const SORT_NATURAL: Record<SortMode, SortDir> = { default: "desc", rarity: "desc", name: "asc", wear: "asc" };
+// What each direction MEANS per mode, for the toggle's tooltip. "Ascending" is
+// useless here; "Lowest float first" is what someone is actually looking for.
+const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
+  default: { desc: "Source order", asc: "Reversed" },
+  rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
+  name: { asc: "A → Z", desc: "Z → A" },
+  wear: { asc: "Lowest float first", desc: "Highest float first" },
+};
+// Which icon pair reads the direction: names get A→Z, a float gets 0→1, a rank
+// gets the narrow/wide bars. See SortDirection.vue.
+const SORT_DIR_KIND: Record<SortMode, SortKind> = {
+  default: "amount",
+  rarity: "amount",
+  name: "alpha",
+  wear: "numeric",
+};
+/**
+ * Direction is remembered PER MODE, not per control.
+ *
+ * A single stored direction per grid meant a preference set on one mode silently
+ * became the default for every other: flip Name to Z→A, come back to Rarity, and
+ * you get lowest-rarity-first for a choice you made about names. Rarity means
+ * highest-first unless you have said otherwise ABOUT RARITY, and per-mode keys are
+ * what makes that true no matter what you touched before.
+ */
+const dirKey = (scope: string, mode: string) => `cs2inv.${scope}Dir.${mode}`;
+function loadDir(scope: string, mode: SortMode): SortDir {
+  const stored = localStorage.getItem(dirKey(scope, mode));
+  return stored === "asc" || stored === "desc" ? stored : SORT_NATURAL[mode];
+}
+
 const invSort = ref<SortMode>((localStorage.getItem("cs2inv.invSort") as SortMode | null) ?? DEFAULT_SORT);
 watch(invSort, (v) => localStorage.setItem("cs2inv.invSort", v));
+const invDir = ref<SortDir>(loadDir("inv", invSort.value));
+watch(invDir, (v) => localStorage.setItem(dirKey("inv", invSort.value), v));
 const sheetSort = ref<SortMode>((localStorage.getItem("cs2inv.sheetSort") as SortMode | null) ?? DEFAULT_SORT);
 watch(sheetSort, (v) => localStorage.setItem("cs2inv.sheetSort", v));
-const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
-function sortInstances(list: InventoryItem[], mode: SortMode): InventoryItem[] {
-  if (mode === "default") return list;
-  const arr = [...list];
-  if (mode === "name") return arr.sort((a, b) => byName(itemName(a.item), itemName(b.item)));
-  if (mode === "wear") return arr.sort((a, b) => (a.wear ?? 1) - (b.wear ?? 1));
-  return arr.sort((a, b) => rarityRank(b.item?.rarity) - rarityRank(a.item?.rarity) || byName(itemName(a.item), itemName(b.item)));
+const sheetDir = ref<SortDir>(loadDir("sheet", sheetSort.value));
+watch(sheetDir, (v) => localStorage.setItem(dirKey("sheet", sheetSort.value), v));
+// Switching mode restores THAT mode's remembered direction, or its natural one.
+// Two setters rather than one taking refs: templates auto-unwrap, so a shared
+// helper would receive the string values instead of the refs to write back to.
+function setInvSort(next: string) {
+  invSort.value = next as SortMode;
+  invDir.value = loadDir("inv", invSort.value);
 }
-function sortSkins(list: Skin[], mode: SortMode): Skin[] {
-  if (mode === "default" || mode === "wear") return list; // catalog skins have no wear
+function setSheetSort(next: string) {
+  sheetSort.value = next as SortMode;
+  sheetDir.value = loadDir("sheet", sheetSort.value);
+}
+const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
+function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): InventoryItem[] {
+  const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
+  if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
-  if (mode === "name") return arr.sort((a, b) => byName(a.name, b.name));
-  return arr.sort((a, b) => rarityRank(b.rarity) - rarityRank(a.rarity) || byName(a.name, b.name));
+  if (mode === "name") return arr.sort((a, b) => flip * byName(itemName(a.item), itemName(b.item)));
+  if (mode === "wear") return arr.sort((a, b) => flip * ((a.wear ?? 1) - (b.wear ?? 1)) || byName(itemName(a.item), itemName(b.item)));
+  return arr.sort((a, b) => flip * (rarityRank(b.item?.rarity) - rarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
+}
+function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
+  if (mode === "wear") return list; // catalog skins have no wear
+  const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
+  if (mode === "default") return flip === 1 ? list : [...list].reverse();
+  const arr = [...list];
+  if (mode === "name") return arr.sort((a, b) => flip * byName(a.name, b.name));
+  return arr.sort((a, b) => flip * (rarityRank(b.rarity) - rarityRank(a.rarity)) || byName(a.name, b.name));
+}
+
+/**
+ * Render window over a list that is already fully in memory — the client half of
+ * infinite scrolling.
+ *
+ * The catalog lists behind these grids are big (2.2k graffiti, 578 knives, and an
+ * inventory can be thousands of items) and every tile is a card with artwork, so
+ * committing the whole list to the DOM at once is what actually made these
+ * screens feel capped. The window grows a page at a time as the sentinel comes
+ * into view; nothing is ever unreachable.
+ *
+ * `reset` is a getter over the FILTER inputs, not the list itself. Watching the
+ * list would send you back to the top of the grid every time anything mutated it
+ * — a render landing, an equip re-sorting — while changing a filter genuinely
+ * should start over at page one.
+ */
+function renderWindow<T>(source: ComputedRef<T[]>, reset: () => unknown, step = 60) {
+  const shown = ref(step);
+  watch(reset, () => {
+    shown.value = step;
+  });
+  return {
+    items: computed(() => (shown.value >= source.value.length ? source.value : source.value.slice(0, shown.value))),
+    done: computed(() => shown.value >= source.value.length),
+    grow: () => {
+      shown.value += step;
+    },
+  };
 }
 
 const teamOk = (teams?: Team[] | null) => !teams || teams.length === 0 || teams.includes(team.value);
@@ -659,6 +752,7 @@ const ownedForSheet = computed(() =>
         (selected.value !== "agent" || teamOk(i.item?.teams)),
     ),
     sheetSort.value,
+    sheetDir.value,
   ),
 );
 // Sheet: ALL catalog skins for the weapon (craft mode).
@@ -669,8 +763,14 @@ const craftList = computed(() =>
       (s) => matchesFilters(itemName(s), s.rarity) && (selected.value !== "agent" || teamOk(s.teams)),
     ),
     sheetSort.value,
+    sheetDir.value,
   ),
 );
+// Both sheet lists scroll rather than truncate. The reset key is every filter
+// that narrows them plus the slot itself — switching weapons is a new list.
+const sheetResetKey = () => [sheetKey.value, sheetMode.value, sheetSearch.value, activeRarity.value, sheetSort.value, sheetDir.value, sheetOrigin.value].join("|");
+const ownedWindow = renderWindow(ownedForSheet, sheetResetKey);
+const craftWindow = renderWindow(craftList, sheetResetKey);
 // Sheet: replace mode — every weapon eligible for this position (defaults are
 // free) plus owned skins of those weapons.
 const replaceOptions = computed(() => {
@@ -1821,6 +1921,11 @@ async function mountModalViewer() {
       return;
     }
     modalViewerHandle = handle;
+    // The options above are a snapshot taken before the GLB loaded, and pressing
+    // Edit during that load flips viewOnly while there is no handle for the
+    // watcher below to talk to. Reconcile here so a mode change can't be lost in
+    // the gap — no-ops when it already matches.
+    handle.setInteractive(!viewOnly.value);
     mdebug("viewer MOUNT done", { model: craftModel.value, gen });
   } catch (e) {
     // Cancelling is the expected outcome of closing the modal mid-load, not an
@@ -1842,6 +1947,14 @@ watch(modal3d, (on) => {
   if (on) void mountModalViewer();
   else teardownModalViewer();
 });
+// View ↔ edit is a flag flip, not a remount (see craftViewEdit for why), so the
+// already-mounted viewer has to be TOLD which mode it is in. Without this the
+// viewer kept whatever `interactive` it was mounted with: opening an item at
+// /items/<id> and pressing Edit gave a weapon that idled on a slow auto-rotate,
+// ignored every attempt to drag a sticker, and showed the SPIN reticle over one
+// — while the same item opened straight into the editor worked. That's the
+// "sometimes I can't drag the sticker" report.
+watch(viewOnly, (on) => modalViewerHandle?.setInteractive(!on));
 // Wear/seed changes retexture the model — debounced remount so slider drags
 // don't recomposite on every tick.
 let retexTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1952,28 +2065,231 @@ watch(
   },
 );
 
-// Sticker/charm picker (searches the catalog server-side).
+// Sticker/charm picker. Searched, FACETED and paged server-side: stickers and
+// charms are ~10.5k items each, far too many to ship in one response, so the grid
+// scrolls through the match set a page at a time. `pickerTotal` is the full match
+// count, which is both the "N stickers" readout and how the sentinel knows when
+// to stop.
+//
+// Three facets, narrowing left to right (see searchAttachments in the backend for
+// how each is derived):
+//   group      Signatures / Team logos / Community — or, for charms, the split
+//              that matters most: 81 real Charms vs 10,565 Sticker Slabs.
+//   collection the capsule it came in, ~61 of them, in release order.
+//   rarity     the usual hex tiers, named by RARITY_META.
+const PICKER_PAGE = 120;
+/**
+ * Which tab each picker OPENS on. A UI decision, so it lives here — the backend
+ * just answers whatever it is asked (its GROUPS table owns the tabs themselves).
+ *
+ * NOT "All", because for both big catalogs "All" is mostly one thing nobody
+ * browses by eye: 7,495 of the 10,565 stickers are player autographs, and 10,565
+ * of the 10,646 charms are Sticker Slabs. Opening on the smaller half is the
+ * difference between a picker and a scroll. Everything is one tab away, counted.
+ */
+const PICKER_DEFAULT_GROUP: Record<"sticker" | "charm" | "patch", string> = {
+  sticker: "community", // the Art tab — 965 art stickers, no crests, no autographs
+  charm: "charm",
+  patch: "",
+};
 const picker = ref<{ kind: "sticker" | "charm" | "patch"; slot: number } | null>(null);
 const pickerQuery = ref("");
+const pickerGroup = ref("");
+const pickerCollection = ref("");
+const pickerRarity = ref("");
+// Remembered across pickers and sessions, like the inventory/sheet sorts — a
+// preference for how to read a catalog isn't per-visit.
+// Rarity by default: it is the one attribute that ranks these against each other,
+// and it's now visible on every tile (the coloured rule + glow), so the grid reads
+// top-down as best-first instead of as arrival order.
+const pickerSort = ref<AttachSort>((localStorage.getItem("cs2inv.pickerSort") as AttachSort | null) ?? "rarity");
+watch(pickerSort, (v) => localStorage.setItem("cs2inv.pickerSort", v));
+const PICKER_SORT_NATURAL: Record<AttachSort, SortDir> = { default: "asc", rarity: "desc", name: "asc" };
+const PICKER_SORT_KIND: Record<AttachSort, SortKind> = { default: "amount", rarity: "amount", name: "alpha" };
+const PICKER_DIR_HINT: Record<AttachSort, Record<SortDir, string>> = {
+  default: { asc: "Oldest capsules first", desc: "Newest capsules first" },
+  rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
+  name: { asc: "A \u2192 Z", desc: "Z \u2192 A" },
+};
+// Per mode, same reason as the grids above — see dirKey/loadDir.
+function loadPickerDir(mode: AttachSort): SortDir {
+  const stored = localStorage.getItem(dirKey("picker", mode));
+  return stored === "asc" || stored === "desc" ? stored : PICKER_SORT_NATURAL[mode];
+}
+const pickerDir = ref<SortDir>(loadPickerDir(pickerSort.value));
+watch(pickerDir, (v) => localStorage.setItem(dirKey("picker", pickerSort.value), v));
+const PICKER_SORTS: { value: AttachSort; label: string }[] = [
+  { value: "rarity", label: "Rarity" },
+  { value: "default", label: "Collection" },
+  { value: "name", label: "Name" },
+];
+const pickerGroups = ref<AttachFacet[]>([]);
+const pickerCollections = ref<AttachFacet[]>([]);
+const pickerRarities = ref<AttachFacet[]>([]);
 const pickerResults = ref<Skin[]>([]);
-const pickerLoading = ref(false);
+const pickerTotal = ref(0);
+const pickerQueryTotal = ref(0);
+const pickerLoading = ref(false); // first page — the grid shows a spinner instead
+const pickerLoadingMore = ref(false); // a later page — the grid stays put
 let pickerTimer: ReturnType<typeof setTimeout> | undefined;
-async function pickerSearch() {
-  if (!picker.value) return;
-  pickerLoading.value = true;
+// Every response is checked against this. A search that resolves after the query
+// moved on (or after the picker closed) must not append its rows to a list that
+// is now about something else — the pages would interleave.
+let pickerToken = 0;
+const pickerDone = computed(() => pickerResults.value.length >= pickerTotal.value);
+
+async function pickerFetch(offset: number) {
+  const p = picker.value;
+  if (!p) return;
+  const token = ++pickerToken;
+  const q = pickerQuery.value;
+  if (offset === 0) {
+    // A new search supersedes any page fetch still in flight. Clear its flag
+    // here: that fetch's own `finally` belongs to a dead token and won't, and a
+    // stuck pickerLoadingMore would block loading forever.
+    pickerLoadingMore.value = false;
+    pickerLoading.value = true;
+  } else {
+    pickerLoadingMore.value = true;
+  }
   try {
-    const fn = picker.value.kind === "sticker" ? searchStickers : picker.value.kind === "patch" ? searchPatches : searchCharms;
-    pickerResults.value = await fn(pickerQuery.value);
+    const page = await searchAttachments(p.kind, {
+      q,
+      group: pickerGroup.value,
+      collection: pickerCollection.value,
+      rarity: pickerRarity.value,
+      sort: pickerSort.value,
+      dir: pickerDir.value,
+      offset,
+      limit: PICKER_PAGE,
+    });
+    if (token !== pickerToken) return;
+    // OUR default tab must never hide the USER's search. On "Logos & Art",
+    // typing a player name returned nothing while 39 signatures sat one tab over
+    // — so when the default (and only the default: `pickerFiltered` is false
+    // exactly while nothing has been chosen by hand) is what emptied the grid,
+    // widen to All and let the tabs show where the matches actually live.
+    // Checked before the assignments so the empty grid never flashes. Terminates:
+    // with no group filter, total is queryTotal, which is > 0 here.
+    if (offset === 0 && page.total === 0 && page.queryTotal > 0 && pickerGroup.value && !pickerFiltered.value) {
+      pickerGroup.value = "";
+      // Bumps the token, so this response is abandoned and the `finally` below
+      // leaves the busy flags to the refetch that now owns them.
+      return void pickerFetch(0);
+    }
+    pickerResults.value = offset === 0 ? page.items : [...pickerResults.value, ...page.items];
+    pickerTotal.value = page.total;
+    pickerQueryTotal.value = page.queryTotal;
+    pickerGroups.value = page.groups;
+    pickerCollections.value = page.collections;
+    pickerRarities.value = page.rarities;
   } catch (e) {
     fail(e);
   } finally {
-    pickerLoading.value = false;
+    // Only the CURRENT request owns the flags — see the token comment above.
+    if (token === pickerToken) {
+      pickerLoading.value = false;
+      pickerLoadingMore.value = false;
+    }
   }
+}
+const pickerSearch = () => pickerFetch(0);
+function pickerMore() {
+  if (pickerLoading.value || pickerLoadingMore.value || pickerDone.value) return;
+  void pickerFetch(pickerResults.value.length);
 }
 watch(pickerQuery, () => {
   clearTimeout(pickerTimer);
   pickerTimer = setTimeout(pickerSearch, 250);
 });
+// Facets are a click, not typing — refetch immediately, and cancel a debounced
+// search so a keystroke from a moment ago can't land after and undo the filter.
+// Sort re-orders the WHOLE match set server-side, so the already-loaded pages are
+// no longer the right first pages — start over from page one.
+function setPickerSort(value: string) {
+  clearTimeout(pickerTimer);
+  pickerSort.value = value as AttachSort;
+  pickerDir.value = loadPickerDir(pickerSort.value);
+  void pickerSearch();
+}
+// Direction re-orders the whole match set server-side, so the loaded pages are no
+// longer the right first pages — same restart as changing the mode.
+function setPickerDir(value: SortDir) {
+  clearTimeout(pickerTimer);
+  pickerDir.value = value;
+  void pickerSearch();
+}
+function setPickerFacet(facet: "group" | "collection" | "rarity", value: string) {
+  clearTimeout(pickerTimer);
+  // Narrowing cascade: a collection only exists within a group and a rarity
+  // within a collection, so picking a coarser facet drops the finer ones. Kept
+  // rather than intersected because the alternative is a filter bar that reads as
+  // set but returns nothing — pick "Charms" while "IEM Katowice" is still on and
+  // there is no such thing.
+  if (facet === "group") {
+    pickerGroup.value = value;
+    pickerCollection.value = "";
+    pickerRarity.value = "";
+  } else if (facet === "collection") {
+    pickerCollection.value = value;
+    pickerRarity.value = "";
+  } else {
+    pickerRarity.value = value;
+  }
+  void pickerSearch();
+}
+// Group tabs as rendered: the catalog's own splits, then All. All goes LAST
+// because it is the fallback, not the starting point — and its count comes from
+// `queryTotal`, since summing the tabs would double-count the union tab.
+const pickerTabs = computed(() =>
+  pickerGroups.value.length
+    ? [...pickerGroups.value, { value: "", label: "All", count: pickerQueryTotal.value }]
+    : [],
+);
+const pickerDefaultGroup = computed(() => (picker.value ? PICKER_DEFAULT_GROUP[picker.value.kind] : ""));
+// Unlike every other pill, these tabs are DATA — they arrive with the first
+// response and a search can change which ones exist at all, so the indicator has
+// to follow the tab list as well as the selection. `immediate` seeds the active
+// key before the list mounts, so the ResizeObserver's first fire measures the
+// selected tab instead of parking the indicator under "All" (key "", which is
+// also makePill's initial activeKey).
+watch([pickerGroup, pickerTabs], () => nextTick(() => pickerGroupPill.sync(pickerGroup.value)), {
+  immediate: true,
+});
+// "Filtered" means "not how it opened" — so Clear appears when there is something
+// to undo, and the default tab alone doesn't count as a filter to clear.
+const pickerFiltered = computed(
+  () => pickerGroup.value !== pickerDefaultGroup.value || !!pickerCollection.value || !!pickerRarity.value,
+);
+// What the footer count is counting. The group label when one is picked, because
+// "10565 charms" is a poor description of 10565 Sticker Slabs.
+const pickerNoun = computed(() => {
+  const group = pickerGroups.value.find((g) => g.value === pickerGroup.value);
+  if (group?.label) return group.label.toLowerCase();
+  const kind = picker.value?.kind ?? "item";
+  return pickerTotal.value === 1 ? kind : `${kind}s`;
+});
+function clearPickerFacets() {
+  clearTimeout(pickerTimer);
+  pickerGroup.value = pickerDefaultGroup.value; // back to how it opened, not to All
+  pickerCollection.value = "";
+  pickerRarity.value = "";
+  void pickerSearch();
+}
+const fmtCount = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
+// "All" first, then the facet's own values with counts. The dropdowns show every
+// option regardless of count because the counts are already narrowed by the
+// facets above — a zero would mean the row shouldn't be there at all.
+const pickerCollectionOptions = computed(() => [
+  { value: "", label: `All collections (${fmtCount(pickerCollections.value.reduce((n, f) => n + f.count, 0))})` },
+  ...pickerCollections.value.map((f) => ({ value: f.value, label: `${f.label ?? f.value} (${f.count})` })),
+]);
+const pickerRarityOptions = computed(() => [
+  { value: "", label: "All rarities", color: null },
+  ...[...pickerRarities.value]
+    .sort((a, b) => rarityRank(b.value) - rarityRank(a.value))
+    .map((f) => ({ value: f.value, label: `${rarityName(f.value)} (${f.count})`, color: f.value })),
+]);
 // Same adjustable-tile treatment as the inventory/loadout grids. Charm and
 // sticker art is small and busy — 92px is a lot of catalog on screen but too
 // little to tell two similar charms apart, so the size is the user's call.
@@ -1991,8 +2307,18 @@ const advancedPlacement = ref(false);
 function openPicker(kind: "sticker" | "charm" | "patch", slot = 0) {
   picker.value = { kind, slot };
   pickerQuery.value = "";
+  pickerGroup.value = PICKER_DEFAULT_GROUP[kind];
+  pickerCollection.value = "";
+  pickerRarity.value = "";
   pickerResults.value = [];
-  pickerSearch();
+  pickerTotal.value = 0;
+  pickerQueryTotal.value = 0;
+  // Cleared too, not just re-fetched: they belong to whichever catalog was open
+  // last, and a stale Sticker Slabs tab over a patch picker is worse than none.
+  pickerGroups.value = [];
+  pickerCollections.value = [];
+  pickerRarities.value = [];
+  void pickerSearch();
 }
 function pickAttachment(item: Skin) {
   if (!craft.value || !picker.value) return;
@@ -2156,6 +2482,7 @@ const invOriginPill = makePill();
 const modal3dPill = makePill();
 const sheetOriginPill = makePill();
 const focus3dPill = makePill();
+const pickerGroupPill = makePill();
 function syncAllPills() {
   viewPill.sync(view.value);
   sheetPill.sync(sheetMode.value);
@@ -2709,8 +3036,12 @@ const filteredInventory = computed(() => {
         matchesRail(i),
     ),
     invSort.value,
+    invDir.value,
   );
 });
+const inventoryWindow = renderWindow(filteredInventory, () =>
+  [invSearch.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join(".")].join("|"),
+);
 function canEquipInstance(i: InventoryItem): boolean {
   if (!i.slot) return false;
   if (isShared(i.slot)) return true;
@@ -3944,11 +4275,13 @@ if (MDEBUG) {
             :options="[{ value: '', label: 'All rarities' }, ...invRarityFacets.map((r) => ({ value: r.hex, label: r.name, color: r.hex }))]"
           />
           <FilterDropdown
-            v-model="invSort"
+            :model-value="invSort"
             prefix="Sort"
             class="shrink-0"
             :options="SORTS.map((s) => ({ value: s[0], label: s[0] === 'default' ? 'Newest' : s[1] }))"
+            @update:model-value="setInvSort"
           />
+          <SortDirection v-model="invDir" :kind="SORT_DIR_KIND[invSort]" :hint="SORT_DIR_HINT[invSort][invDir]" />
           <button
             v-if="filtersActive"
             class="flex h-8 shrink-0 items-center gap-1 rounded-md px-2 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
@@ -4097,7 +4430,7 @@ if (MDEBUG) {
           <!-- A click OPENS the item (see it big, then decide). Equipping moved
                into the detail modal so a stray click can't re-equip a slot. -->
           <ItemTile
-            v-for="i in filteredInventory"
+            v-for="i in inventoryWindow.items.value"
             :key="i.id"
             :inst="i"
             show-header
@@ -4112,6 +4445,14 @@ if (MDEBUG) {
             @edit="openEdit(i)"
             @duplicate="openEdit(i)"
             @remove="deleteOwned(i)"
+          />
+          <!-- Keyed: TransitionGroup requires it, and a stable key keeps the
+               sentinel out of the move/enter animations. -->
+          <InfiniteSentinel
+            key="more"
+            :count="inventoryWindow.items.value.length"
+            :done="inventoryWindow.done.value"
+            @hit="inventoryWindow.grow"
           />
         </TransitionGroup>
         </div>
@@ -4834,12 +5175,15 @@ if (MDEBUG) {
                something on owned items. The "Sort" prefix matters: bare
                "Rarity" next to the actual rarity dropdown read as a second,
                broken rarity filter. -->
-          <FilterDropdown
-            v-if="sheetMode !== 'replace' && (!isCompact || sheetFiltersOpen)"
-            v-model="sheetSort"
-            prefix="Sort"
-            :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
-          />
+          <template v-if="sheetMode !== 'replace' && (!isCompact || sheetFiltersOpen)">
+            <FilterDropdown
+              :model-value="sheetSort"
+              prefix="Sort"
+              :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
+              @update:model-value="setSheetSort"
+            />
+            <SortDirection v-model="sheetDir" :kind="SORT_DIR_KIND[sheetSort]" :hint="SORT_DIR_HINT[sheetSort][sheetDir]" />
+          </template>
           <!-- Owned only: same Synced/Crafted filter as the Inventory grid, so
                read-only Steam imports can be kept out of the equip picker. -->
           <div
@@ -4996,9 +5340,21 @@ if (MDEBUG) {
                     :class="sheetSort === s[0] ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground'"
                     :style="sheetSort === s[0] ? { background: accentSoft } : {}"
                     :disabled="s[0] === 'wear' && sheetMode === 'craft'"
-                    @click="sheetSort = s[0]"
+                    @click="setSheetSort(s[0])"
                   >
                     {{ s[1] }}
+                  </button>
+                  <!-- Direction is part of the sort, so it belongs in this section
+                       rather than only on the desktop toolbar. Spelled out here
+                       because there's room for words — the icon alone carries it
+                       on the toolbar. Inline icon rather than <SortDirection>: this
+                       IS the button, and nesting one inside it is invalid HTML. -->
+                  <button
+                    class="flex items-center gap-1.5 rounded-md border border-border/60 px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors"
+                    @click="sheetDir = sheetDir === 'desc' ? 'asc' : 'desc'"
+                  >
+                    <component :is="SORT_DIR_ICON[SORT_DIR_KIND[sheetSort]][sheetDir]" class="h-3.5 w-3.5" />
+                    {{ SORT_DIR_HINT[sheetSort][sheetDir] }}
                   </button>
                 </div>
               </section>
@@ -5098,7 +5454,7 @@ if (MDEBUG) {
                  plus fingernail-sized hover icons made the tiles a minefield,
                  and the menu's Equip rows are the same one tap anyway. -->
             <ItemTile
-              v-for="(i, idx) in ownedForSheet"
+              v-for="(i, idx) in ownedWindow.items.value"
               :key="i.id"
               :inst="i"
               class="animate-sheet-in"
@@ -5118,7 +5474,11 @@ if (MDEBUG) {
               @duplicate="openEdit(i)"
               @remove="deleteOwned(i)"
             />
-
+            <InfiniteSentinel
+              :count="ownedWindow.items.value.length"
+              :done="ownedWindow.done.value"
+              @hit="ownedWindow.grow"
+            />
           </template>
 
           <!-- CRAFT: full catalog for the slot's weapon -->
@@ -5128,7 +5488,7 @@ if (MDEBUG) {
             </div>
             <template v-else>
               <button
-                v-for="(s, idx) in craftList"
+                v-for="(s, idx) in craftWindow.items.value"
                 :key="s.id"
                 data-role="skin"
                 class="group animate-sheet-in relative flex h-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
@@ -5144,6 +5504,11 @@ if (MDEBUG) {
                 </div>
                 <ItemName :item="s" strip class="relative z-[2]" />
               </button>
+              <InfiniteSentinel
+                :count="craftWindow.items.value.length"
+                :done="craftWindow.done.value"
+                @hit="craftWindow.grow"
+              />
               <div v-if="!craftList.length" class="col-span-full py-8 text-center text-sm text-muted-foreground">
                 No finishes match your filters.
               </div>
@@ -5226,7 +5591,11 @@ if (MDEBUG) {
          this was only the editor and the page behind it was noise; now that it's
          also how you LOOK at an item, letting the inventory show through is what
          says "this is on top of your stuff", not a new page. -->
-    <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm" @click.self="closeCraft()">
+    <!-- Backdrop click unwinds ONE layer, same rule as the Escape chain: with the
+         attachment picker up it closes back to the editor rather than throwing the
+         whole craft away. Dismissing a picker must never discard the edit behind
+         it — that's a lost sticker placement, not a closed dialog. -->
+    <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm" @click.self="picker ? (picker = null) : closeCraft()">
       <div class="relative flex h-[min(92vh,940px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in">
         <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
           <!-- Provenance and where it's equipped belong to the item's IDENTITY,
@@ -5676,8 +6045,99 @@ if (MDEBUG) {
                 @click="pickerQuery = ''"
               ><X class="h-3.5 w-3.5" /></button>
             </div>
-            <button class="text-muted-foreground transition-colors hover:text-foreground" @click="picker = null"><X class="h-4 w-4" /></button>
+            <!-- Says where it goes. A bare ✕ in the same corner as the craft
+                 modal's own ✕ reads as "close everything", which is the one thing
+                 it must not do — the edit underneath is unsaved. -->
+            <button
+              class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              title="Back to the editor — nothing is applied"
+              @click="picker = null"
+            >
+              <X class="h-3.5 w-3.5" /> Back
+            </button>
           </div>
+
+          <!-- Facet bar. Counts are on every control on purpose: with 10.5k
+               stickers the useful question is never "does this exist" but "how
+               much am I about to wade through". Each NARROWING control hides
+               itself when the catalog behind it has nothing to split (patches have
+               no groups and no collections, so a patch picker shows rarity alone),
+               while the bar itself always renders — Sort is always meaningful, and
+               a bar that can vanish could strand an active filter with no visible
+               control to switch it off. -->
+          <div class="mb-3 flex flex-wrap items-center gap-2">
+            <!-- Same sliding-pill animated tabs as every other tab group, with
+                 the list driven by the facets rather than hardcoded. -->
+            <div
+              v-if="pickerTabs.length > 1"
+              :ref="(el) => pickerGroupPill.setListEl(el)"
+              class="relative inline-flex h-8 flex-none items-center rounded-lg bg-muted p-1"
+            >
+              <div
+                v-show="pickerGroupPill.w.value > 0"
+                class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+                :style="{
+                  transform: `translateX(${pickerGroupPill.x.value}px)`,
+                  width: pickerGroupPill.w.value + 'px',
+                  border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
+                  background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
+                  boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
+                  transition: pickerGroupPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                }"
+              ></div>
+              <button
+                v-for="g in pickerTabs"
+                :key="g.value"
+                :ref="(el) => pickerGroupPill.setRef(g.value, el)"
+                class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
+                :class="pickerGroup === g.value ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
+                @click="setPickerFacet('group', g.value)"
+              >
+                {{ g.label }}
+                <!-- Wider than the other count badges and square-cornered, not a
+                     circle: these read "10.6k", where a pill sized for "12" put
+                     the text against its own border. -->
+                <span class="ml-1.5 inline-flex h-[15px] min-w-[20px] items-center justify-center rounded border border-border bg-background/70 px-1.5 font-mono text-f9 leading-none">{{ fmtCount(g.count) }}</span>
+              </button>
+            </div>
+            <FilterDropdown
+              v-if="pickerCollections.length > 1"
+              :model-value="pickerCollection"
+              :options="pickerCollectionOptions"
+              prefix="Collection"
+              @update:model-value="setPickerFacet('collection', $event)"
+            />
+            <FilterDropdown
+              v-if="pickerRarities.length > 1"
+              :model-value="pickerRarity"
+              :options="pickerRarityOptions"
+              dots
+              @update:model-value="setPickerFacet('rarity', $event)"
+            />
+            <button
+              v-if="pickerFiltered"
+              class="flex h-8 items-center gap-1.5 rounded-md px-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:text-foreground"
+              @click="clearPickerFacets"
+            >
+              <X class="h-3 w-3" /> Clear
+            </button>
+            <!-- Sort sits apart from the narrowing controls: it changes the ORDER
+                 of the same set, so Clear has nothing to do with it. -->
+            <FilterDropdown
+              class="ml-auto"
+              :model-value="pickerSort"
+              :options="PICKER_SORTS"
+              prefix="Sort"
+              @update:model-value="setPickerSort"
+            />
+            <SortDirection
+              :model-value="pickerDir"
+              :kind="PICKER_SORT_KIND[pickerSort]"
+              :hint="PICKER_DIR_HINT[pickerSort][pickerDir]"
+              @update:model-value="setPickerDir"
+            />
+          </div>
+
           <div
             class="flex-1 content-start gap-2 overflow-y-auto"
             :style="attachGridStyle"
@@ -5685,20 +6145,42 @@ if (MDEBUG) {
             <div v-if="pickerLoading" class="col-span-full flex items-center justify-center gap-2 py-8 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" /> Searching…
             </div>
+            <!-- Rarity is read the same way as on a weapon card: the tier's colour
+                 as a bottom rule plus a soft glow behind the art. Without it the
+                 grid is a wall of identical grey boxes and the one attribute that
+                 sorts them is invisible. -->
             <button
               v-for="it in pickerResults"
               :key="it.id"
-              class="group flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
+              class="group relative flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
+              :style="it.rarity ? { borderBottom: `3px solid ${it.rarity}` } : {}"
               :title="it.name"
               @click="pickAttachment(it)"
             >
-              <div :class="CARD_ART">
+              <span class="pointer-events-none absolute inset-0" :style="glowStyle(it.rarity, 0.22)"></span>
+              <div :class="CARD_ART" class="relative z-[2]">
                 <img :src="it.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
               </div>
-              <span class="w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm) \| /, '') }}</span>
+              <span class="relative z-[2] w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm|Sticker Slab) \| /, '') }}</span>
             </button>
             <div v-if="!pickerLoading && !pickerResults.length" class="col-span-full py-8 text-center text-f13 text-muted-foreground">
               No results — try a different search.
+            </div>
+            <!-- Scrolling to the bottom pulls the next page. `done` also carries
+                 the first-page spinner: without it the sentinel is on screen
+                 under an empty grid and would fire a second, duplicate page. -->
+            <InfiniteSentinel
+              :count="pickerResults.length"
+              :done="pickerDone || pickerLoading"
+              @hit="pickerMore"
+            />
+            <div
+              v-if="!pickerLoading && pickerResults.length"
+              class="col-span-full flex items-center justify-center gap-2 py-4 text-f10 uppercase tracking-cs1 text-muted-foreground"
+            >
+              <template v-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
+              <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
+              <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
             </div>
           </div>
         </div>

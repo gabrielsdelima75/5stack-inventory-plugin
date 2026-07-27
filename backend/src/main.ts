@@ -17,9 +17,10 @@ import {
   getKnives,
   getGloves,
   getMusicKits,
-  getStickers,
-  getCharms,
-  getPatches,
+  searchAttachments,
+  type AttachKind,
+  type AttachQuery,
+  type AttachSort,
   getGraffiti,
   getItemsByIds,
   getItem,
@@ -377,7 +378,7 @@ app.get<{ Querystring: { slot?: string } }>(
       return { base: null, skins: getMusicKits() };
     }
     if (slot === "graffiti") {
-      return { base: null, skins: getGraffiti("") };
+      return { base: null, skins: getGraffiti() };
     }
     if (slot === "zeus") {
       return getWeaponSkins("taser");
@@ -389,15 +390,58 @@ app.get<{ Querystring: { slot?: string } }>(
   },
 );
 
-app.get<{ Querystring: { q?: string } }>("/api/catalog/stickers", async (request) => {
-  return getStickers(request.query.q ?? "");
-});
-app.get<{ Querystring: { q?: string } }>("/api/catalog/charms", async (request) => {
-  return getCharms(request.query.q ?? "");
-});
-app.get<{ Querystring: { q?: string } }>("/api/catalog/patches", async (request) => {
-  return getPatches(request.query.q ?? "");
-});
+// Attachment pickers: one page of matches, the match total so the grid can scroll
+// on into a 10k-item catalog instead of stopping at an arbitrary cap, and the
+// facet counts that draw the filter bar. See searchAttachments for the facets.
+//
+// The page ceiling is a guard against a hand-written ?limit=99999 dumping the
+// catalog in one response, not a product limit — the client asks for another page.
+const CATALOG_PAGE = 120;
+const CATALOG_PAGE_MAX = 500;
+type PageQuery = {
+  q?: string;
+  group?: string;
+  collection?: string;
+  rarity?: string;
+  sort?: string;
+  dir?: string;
+  offset?: string;
+  limit?: string;
+};
+const ATTACH_SORTS = new Set<AttachSort>(["default", "rarity", "name"]);
+
+function attachQuery(kind: AttachKind, query: PageQuery): AttachQuery {
+  const asked = Math.floor(Number(query.limit)) || CATALOG_PAGE;
+  const sort = query.sort as AttachSort | undefined;
+  return {
+    kind,
+    q: query.q ?? "",
+    group: query.group ?? "",
+    collection: query.collection ?? "",
+    rarity: query.rarity ?? "",
+    // An unknown sort falls back to catalog order rather than 400ing — a stale
+    // link should show the catalog, not an error. An absent `dir` lets the sort's
+    // own natural direction apply.
+    sort: sort && ATTACH_SORTS.has(sort) ? sort : "default",
+    dir: query.dir === "asc" || query.dir === "desc" ? query.dir : undefined,
+    offset: Math.max(0, Math.floor(Number(query.offset)) || 0),
+    limit: Math.min(CATALOG_PAGE_MAX, Math.max(1, asked)),
+  };
+}
+
+// One handler shape, three paths — the pickers differ only in which catalog they
+// browse. Paths kept as-is (rather than folded into ?kind=) so a frontend bundle
+// from before the facets existed keeps working against this backend: the extra
+// fields in the response are simply ignored by it.
+for (const [path, kind] of [
+  ["stickers", "sticker"],
+  ["charms", "charm"],
+  ["patches", "patch"],
+] as [string, AttachKind][]) {
+  app.get<{ Querystring: PageQuery }>(`/api/catalog/${path}`, async (request) =>
+    searchAttachments(attachQuery(kind, request.query)),
+  );
+}
 
 // Bulk id → item lookup, for rehydrating a shared craft link. Capped so a
 // hand-written ?ids= can't turn into a catalog dump.

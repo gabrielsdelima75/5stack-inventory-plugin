@@ -150,22 +150,284 @@ export function getMusicKits(): CatalogSkin[] {
     }));
 }
 
-// Stickers/charms are huge catalogs (thousands) — search server-side.
-function searchByType(type: string, q: string, limit: number): CatalogSkin[] {
-  const needle = q.trim().toLowerCase();
-  const out: CatalogSkin[] = [];
+// ---- Attachment browsing (stickers / charms / patches) ----------------------
+//
+// Stickers and charms are ~10.5k items EACH, so the pickers search, FACET and
+// page server-side — a full sticker list is over a megabyte of JSON, and a flat
+// name search over that many near-identical names ("Sticker | <team> | <event>",
+// twenty variants each) isn't browsing, it's guessing. Every item is indexed
+// once at startup under three facets, and a query narrows by all three.
+//
+// There used to be a flat `limit = 80` here with no offset, which silently made
+// the picker "the first 80 stickers whose name contains your query" — with no
+// way to reach the rest and nothing on screen saying so.
+
+export type AttachKind = "sticker" | "charm" | "patch";
+
+/** cs2-lib `type` behind each picker. "charm" is the game's `keychain`. */
+const ATTACH_TYPE: Record<AttachKind, string> = { sticker: "sticker", charm: "keychain", patch: "patch" };
+
+/**
+ * Sub-kind facet — the coarse "what IS this" split, which no single cs2-lib
+ * field carries. Derived per kind:
+ *
+ * CHARMS. 10,565 of the 10,646 `keychain` items are Sticker Slabs (the hanging
+ * slab version of a sticker, one per sticker) and only 81 are actual Charms.
+ * Undivided, the charm picker is a wall of slabs with the charms lost in it.
+ *
+ * STICKERS. Player autographs are exactly the ones whose artwork stem is
+ * `sig_*` — that is the game's own naming and it covers 7,495 of them with no
+ * exceptions (every `sig_` sticker also carries a tournamentDesc, so the two
+ * signals agree). What's left in a tournament capsule is team logos; what's
+ * outside one is community/licensed art.
+ */
+interface GroupDef {
+  value: string;
+  label: string;
+  /** Indexed groups this tab covers. More than one would be a UNION tab. */
+  members: string[];
+}
+// Tab order as shown, left to right — most browsable first, and the picker opens
+// on whichever is first (see PICKER_DEFAULT_GROUP in App.vue). "All" is not here:
+// it's the frontend's own (value ""), and it goes LAST, after the useful splits.
+//
+// Deliberately three DISJOINT sticker tabs rather than a "not an autograph"
+// union. That union read as "Logos & Art" and was mostly logos — 2,105 team
+// crests drowning the 965 actual art stickers, which is the same burying problem
+// one level down. Logos have their own tab; art means art.
+const GROUPS: Record<AttachKind, GroupDef[]> = {
+  sticker: [
+    { value: "community", label: "Art", members: ["community"] },
+    { value: "team", label: "Team Logos", members: ["team"] },
+    // Last, and never the default: 7,495 of the 10,565 stickers are player
+    // autographs, up to twenty near-identical variants each. Nothing anyone
+    // picks by eye is in here — you get here by searching a player's name.
+    { value: "signature", label: "Signatures", members: ["signature"] },
+  ],
+  charm: [
+    { value: "charm", label: "Charms", members: ["charm"] },
+    { value: "slab", label: "Sticker Slabs", members: ["slab"] },
+  ],
+  patch: [],
+};
+const SLAB_PREFIX = "Sticker Slab | ";
+
+export interface AttachFacet {
+  value: string;
+  /** Absent for rarity — those are hex colours the frontend already names. */
+  label?: string;
+  count: number;
+}
+export interface AttachPage {
+  items: CatalogSkin[];
+  total: number;
+  /** Matches for the text query ALONE — what the "All" tab counts. Can't be
+   *  derived from `groups`: one of those is a union of the others. */
+  queryTotal: number;
+  groups: AttachFacet[];
+  collections: AttachFacet[];
+  rarities: AttachFacet[];
+}
+
+interface AttachEntry {
+  id: number;
+  name: string;
+  rarity: string;
+  image: string | null;
+  group: string;
+  /** Capsule / collection this came in. "" for the items that belong to none. */
+  collection: string;
+  /** Lowercased name, precomputed — the search runs on every keystroke. */
+  search: string;
+}
+
+// Built once, lazily, and held for the process. Also replaces a full 27k-item
+// scan per keystroke with a walk over just the ~21k rows that can ever match.
+const attachIndexes = new Map<AttachKind, AttachEntry[]>();
+
+function buildAttachIndex(kind: AttachKind): AttachEntry[] {
+  const type = ATTACH_TYPE[kind];
+  // A slab and its sticker share everything but the name prefix, and only the
+  // STICKER carries the capsule, so slabs borrow their collection through the
+  // name. Exact for all 10,565 of them — see the test in tools, and note that a
+  // miss degrades to "no collection" rather than to a wrong one.
+  const stickerCollections =
+    kind === "charm"
+      ? new Map(items.filter((i) => i.type === "sticker").map((i) => [i.name, (i.category as string) ?? ""]))
+      : null;
+  const out: AttachEntry[] = [];
   for (const i of items) {
     if (i.type !== type) continue;
-    if (needle && !i.name.toLowerCase().includes(needle)) continue;
-    out.push({ id: i.id, name: i.name, rarity: i.rarity as string, image: img(i.image) });
-    if (out.length >= limit) break;
+    let group = "";
+    let collection = (i.category as string) ?? "";
+    if (kind === "sticker") {
+      group = /\/images\/sig_/.test(i.image ?? "") ? "signature" : i.tournamentDesc ? "team" : "community";
+    } else if (kind === "charm") {
+      const slab = i.name.startsWith(SLAB_PREFIX);
+      group = slab ? "slab" : "charm";
+      collection = slab ? stickerCollections?.get(`Sticker | ${i.name.slice(SLAB_PREFIX.length)}`) ?? "" : "";
+    }
+    out.push({
+      id: i.id,
+      name: i.name,
+      rarity: i.rarity as string,
+      image: img(i.image),
+      group,
+      collection,
+      search: i.name.toLowerCase(),
+    });
   }
   return out;
 }
-export const getStickers = (q: string, limit = 80) => searchByType("sticker", q, limit);
-export const getCharms = (q: string, limit = 80) => searchByType("keychain", q, limit);
-export const getPatches = (q: string, limit = 80) => searchByType("patch", q, limit);
-export const getGraffiti = (q: string, limit = 120) => searchByType("graffiti", q, limit);
+
+function attachIndex(kind: AttachKind): AttachEntry[] {
+  let index = attachIndexes.get(kind);
+  if (!index) {
+    index = buildAttachIndex(kind);
+    attachIndexes.set(kind, index);
+  }
+  return index;
+}
+
+/**
+ * Sort has to happen HERE, not in the picker: the grid only ever holds the pages
+ * it has scrolled through, so sorting client-side would order those and leave the
+ * rest of the 10k arriving in catalog order underneath.
+ *
+ * "default" is catalog order, which is roughly release order and groups a capsule
+ * together — the best default for browsing, and free (no sort at all).
+ */
+export type AttachSort = "default" | "rarity" | "name";
+export type AttachDir = "asc" | "desc";
+/** Each sort's natural direction — the one you meant by picking it. A flip negates
+ *  the PRIMARY key only, so the name tiebreak stays A→Z either way. */
+const ATTACH_NATURAL: Record<AttachSort, AttachDir> = { default: "asc", rarity: "desc", name: "asc" };
+
+// Rarity is a hex colour in cs2-lib with no inherent order, so ranking it needs a
+// table. Mirrors RARITY_META in the frontend, which names the same tiers.
+const RARITY_RANK: Record<string, number> = {
+  "#b0c3d9": 1, // Consumer
+  "#ded6cc": 1, // (the handful of very old stickers)
+  "#5e98d9": 2, // Industrial
+  "#4b69ff": 3, // Mil-Spec
+  "#8847ff": 4, // Restricted
+  "#d32ce6": 5, // Classified
+  "#eb4b4b": 6, // Covert
+  "#e4ae39": 7, // ★ Rare
+  "#ffd700": 7,
+  "#ffae39": 7,
+};
+const rarityRank = (hex: string) => RARITY_RANK[hex?.toLowerCase()] ?? 0;
+
+export interface AttachQuery {
+  kind: AttachKind;
+  q?: string;
+  group?: string;
+  collection?: string;
+  rarity?: string;
+  sort?: AttachSort;
+  dir?: AttachDir;
+  offset?: number;
+  limit?: number;
+}
+
+const bump = (into: Map<string, number>, key: string) => into.set(key, (into.get(key) ?? 0) + 1);
+
+/**
+ * One page of an attachment search, plus the facet counts to draw the filter bar.
+ *
+ * Each facet is counted with the filters ABOVE it applied and its own ignored —
+ * group, then collection, then rarity. That's what keeps the bar usable: counted
+ * with its own filter applied, a facet list would collapse to the single value
+ * you just picked and there'd be no way to switch to another without clearing.
+ */
+export function searchAttachments(query: AttachQuery): AttachPage {
+  const needle = (query.q ?? "").trim().toLowerCase();
+  const group = query.group ?? "";
+  const collection = query.collection ?? "";
+  const rarity = query.rarity ?? "";
+  const offset = query.offset ?? 0;
+  const limit = query.limit ?? Infinity;
+  const groups = new Map<string, number>();
+  const collections = new Map<string, number>();
+  const rarities = new Map<string, number>();
+  const out: CatalogSkin[] = [];
+  let total = 0;
+  let queryTotal = 0;
+  // An unrecognised group (a stale link, a renamed tab) reads as "All" rather
+  // than as an empty grid — nothing is hidden by a filter nobody chose.
+  const members = GROUPS[query.kind].find((g) => g.value === group)?.members;
+  // Sorted queries have to see the whole match set before they can know what
+  // belongs on this page, so they collect first and slice after. Unsorted stays
+  // streaming: it never holds more than one page, which is what keeps the default
+  // "All stickers" open cheap.
+  const sort = query.sort ?? "default";
+  const dir = query.dir ?? ATTACH_NATURAL[sort];
+  const flip = dir === ATTACH_NATURAL[sort] ? 1 : -1;
+  // Streaming only survives the one case that needs no reordering at all.
+  const ordered = sort !== "default" || flip === -1;
+  const matched: AttachEntry[] = [];
+  for (const e of attachIndex(query.kind)) {
+    if (needle && !e.search.includes(needle)) continue;
+    queryTotal++;
+    if (e.group) bump(groups, e.group);
+    if (members && !members.includes(e.group)) continue;
+    if (e.collection) bump(collections, e.collection);
+    if (collection && e.collection !== collection) continue;
+    bump(rarities, e.rarity);
+    if (rarity && e.rarity !== rarity) continue;
+    total++;
+    if (ordered) {
+      matched.push(e);
+      continue;
+    }
+    // Keep counting past the page — `total` drives the infinite scroll.
+    if (total <= offset || out.length >= limit) continue;
+    out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image });
+  }
+  if (ordered) {
+    // Rarity naturally descending (covert first, like the weapon sheets), with
+    // name as the tiebreak so the order is TOTAL. A partial order would let
+    // equal-ranked items shuffle between page fetches and the same sticker could
+    // arrive twice, or never — the pages are requested separately.
+    if (sort === "name") matched.sort((a, b) => flip * a.name.localeCompare(b.name));
+    else if (sort === "rarity") {
+      matched.sort((a, b) => flip * (rarityRank(b.rarity) - rarityRank(a.rarity)) || a.name.localeCompare(b.name));
+    } else matched.reverse(); // "default" reversed = newest capsules first
+    for (const e of matched.slice(offset, offset + (limit === Infinity ? matched.length : limit))) {
+      out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image });
+    }
+  }
+  return {
+    items: out,
+    total,
+    queryTotal,
+    // Fixed order, so the tabs don't reshuffle as counts change. A union tab sums
+    // its members; a tab with nothing behind it is dropped.
+    groups: GROUPS[query.kind]
+      .map((g) => ({
+        value: g.value,
+        label: g.label,
+        count: g.members.reduce((n, m) => n + (groups.get(m) ?? 0), 0),
+      }))
+      .filter((g) => g.count > 0),
+    // Insertion order = catalog order ≈ release order, which reads far better
+    // for capsules than alphabetical ("2013 DreamHack Winter" first, newest last).
+    collections: [...collections].map(([value, count]) => ({ value, label: value, count })),
+    rarities: [...rarities].map(([value, count]) => ({ value, count })),
+  };
+}
+
+// The graffiti SHEET is a different shape from the pickers: it filters, sorts
+// and facets client-side over the whole list (like every other weapon sheet), so
+// paging it server-side would quietly reduce its search box to "search the pages
+// you happen to have loaded". ~2.2k items is small enough to hand over whole and
+// let the grid's render window keep the DOM sane.
+export function getGraffiti(): CatalogSkin[] {
+  return items
+    .filter((i) => i.type === "graffiti")
+    .map((i) => ({ id: i.id, name: i.name, rarity: i.rarity as string, image: img(i.image) }));
+}
 
 // Resolve items by id. Shareable craft links carry only ids (a URL can't hold
 // names and CDN paths for five stickers), so opening one has to turn those ids

@@ -55,7 +55,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
     <div v-if="open" class="fixed inset-0 z-[90]" @click="open = false"></div>
     <div
       v-if="open"
-      class="absolute left-0 top-full z-[91] mt-1 min-w-full origin-top-left animate-menu-in overflow-hidden rounded-md border border-border bg-card py-1 shadow-2xl"
+      class="absolute left-0 top-full z-[91] mt-1 max-h-[min(60vh,26rem)] min-w-full origin-top-left animate-menu-in overflow-y-auto rounded-md border border-border bg-card py-1 shadow-2xl"
     >
       <!-- Active row wears the same tinted fill as the filter-sheet chips. -->
       <button
