@@ -49,6 +49,26 @@ export interface Skin {
   // nothing else, and the type is what tells a sticker from a charm.
   model?: string | null;
   type?: string;
+  /** Game defindex. Absent = no inspect link is possible for this item. */
+  def?: number;
+  // ---- sheet facets. Only graffiti carries these today; the sheet's filter bar
+  // is driven entirely by which of them appear on the list it loaded, so a
+  // catalog without them renders exactly as it did before.
+  /** Coarse "what IS this" split — the sheet's tab strip. */
+  group?: string;
+  /** Capsule / box / tournament it came in. Absent when it came in none. */
+  collection?: string;
+  /** Artwork identity shared by every colour variant — the STACK key. */
+  design?: number;
+  /** That variant's colourway ("Cash Green"). */
+  tintName?: string;
+}
+
+/** Facet metadata a catalog can ship next to its skins, for the values the
+ *  sheet can't name or order by itself (a tab's label, a colourway's swatch). */
+export interface SheetFacets {
+  groups: { value: string; label: string }[];
+  tints: { value: string; label: string; color: string }[];
 }
 
 export interface DefaultsMap {
@@ -87,6 +107,12 @@ export interface CatalogItem {
   teams?: Team[];
   paintMaterial?: string | null;
   legacyPaint?: boolean;
+  /** Game defindex. Absent = no inspect link is possible for this item. */
+  def?: number;
+  /** Artwork identity shared by every colour variant — see `Skin.design`. */
+  design?: number;
+  /** That variant's colourway ("Cash Green"). */
+  tintName?: string;
 }
 
 export interface LoadoutEntry {
@@ -387,10 +413,18 @@ export function fetchStickerGeometry(model: string): Promise<StickerGeometry> {
 }
 export const fetchStickerBounds = (model: string) => fetchStickerGeometry(model).then((g) => g.bounds);
 
+// Facets are normalised at the boundary rather than trusted: frontend and
+// backend ship as separate images, so a response from a backend that predates
+// them has to read as "this catalog has no facets", not throw in a computed.
 export const fetchSkins = (slot: string) =>
-  request<{ base: Skin | null; skins: Skin[] }>(
+  request<{ base: Skin | null; skins: Skin[] } & Partial<SheetFacets>>(
     `/catalog/skins?slot=${encodeURIComponent(slot)}`,
-  );
+  ).then((r) => ({
+    base: r.base ?? null,
+    skins: r.skins ?? [],
+    groups: Array.isArray(r.groups) ? r.groups : [],
+    tints: Array.isArray(r.tints) ? r.tints : [],
+  }));
 
 export const fetchLoadout = () => request<LoadoutEntry[]>("/loadout");
 
@@ -539,6 +573,12 @@ export const importSteamInventory = () =>
     method: "POST",
     body: "{}",
   });
+
+// null = this account has never run a sync (the UI nags about it). Older
+// backends don't have the route; callers treat a failure as "already synced"
+// rather than nagging everyone on a version skew.
+export const fetchSteamSync = () =>
+  request<{ syncedAt: string | null }>("/inventory/steam-sync");
 
 // Admin: cached-asset stats + clearing (renders / paints on the mount).
 export type DirStat = { files: number; bytes: number };

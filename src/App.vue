@@ -5,7 +5,7 @@ import en from "./locales/en.json";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -26,6 +26,7 @@ import {
   type ExtractStatus,
   fetchPlayerLoadout,
   importSteamInventory,
+  fetchSteamSync,
   API_ORIGIN,
   equip,
   swapLoadout,
@@ -35,6 +36,7 @@ import {
   type DefaultsMap,
   type CatalogItem,
   type Skin,
+  type SheetFacets,
   type LoadoutEntry,
   type InventoryItem,
   type AttachSpec,
@@ -73,7 +75,7 @@ import InfiniteSentinel from "./InfiniteSentinel.vue";
 import SortDirection from "./SortDirection.vue";
 import ViewerControls from "./ViewerControls.vue";
 import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
-import { ART_FADE_B, attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, wearTier } from "./itemVisuals";
+import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, STEAM_BLUE, stripName, wearTier } from "./itemVisuals";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller } from "./dom";
 import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
@@ -553,11 +555,24 @@ const selected = ref<string>("r2"); // AK-47 / M4A4 slot
 // Signed out there is no "owned" tab to land on, so the sandbox is the default
 // rather than an empty shelf.
 const sheetMode = ref<"owned" | "craft" | "replace">(signedIn.value ? "owned" : "craft");
-const skinsCache = new Map<string, { base: Skin | null; skins: Skin[] }>();
+const skinsCache = new Map<string, { base: Skin | null; skins: Skin[] } & SheetFacets>();
 const sheetSkins = ref<Skin[]>([]);
+// Labels and ordering the sheet can't work out from the items alone — a tab's
+// display name, a colourway's swatch. Empty for every catalog but graffiti,
+// which is what keeps the extra controls off every other weapon sheet.
+const sheetFacets = ref<SheetFacets>({ groups: [], tints: [] });
 const sheetLoading = ref(false);
 const sheetSearch = ref("");
 const activeRarity = ref<string>("");
+// Graffiti-shaped facets. Nothing here is slot-aware: each control shows only
+// when the loaded catalog actually has more than one value behind it.
+const sheetGroup = ref<string>("");
+const sheetCollection = ref<string>("");
+const sheetTint = ref<string>("");
+// Drill-in: the `design` of the stack being opened, or null for the grid of
+// stacks. Every filter change clears it — you can't be inside a card that the
+// filters just removed.
+const sheetDesign = ref<number | null>(null);
 
 // What the sheet is about: the weapon occupying the selected position (or the
 // special slot type).
@@ -577,22 +592,39 @@ async function loadSkins(key: string) {
     }
     if (sheetKey.value !== key) return; // a newer selection won
     sheetSkins.value = data.skins;
+    sheetFacets.value = { groups: data.groups, tints: data.tints };
+    sheetGroup.value = sheetDefaultGroup.value;
   } catch (e) {
     fail(e);
   } finally {
     if (sheetKey.value === key) sheetLoading.value = false;
   }
 }
+// One place to clear the catalog-shaped filters, because there are four of them
+// and four reset points — a filter left set on a list it no longer applies to
+// shows an empty grid with no visible cause.
+// The catalog opens on its FIRST declared tab, not on "All" — the backend
+// orders them most-browsable-first for exactly this (graffiti: Art, then the
+// 384 tournament crests). "All" is still there, last, when you want it.
+const sheetDefaultGroup = computed(() => sheetFacets.value.groups[0]?.value ?? "");
+function clearSheetFacets() {
+  activeRarity.value = "";
+  sheetGroup.value = sheetDefaultGroup.value;
+  sheetCollection.value = "";
+  sheetTint.value = "";
+  sheetDesign.value = null;
+}
 watch(sheetKey, (key) => {
   sheetSearch.value = "";
-  activeRarity.value = "";
+  clearSheetFacets();
   sheetSkins.value = [];
+  sheetFacets.value = { groups: [], tints: [] };
   loadSkins(key);
 });
 // Switching sheet modes also resets the filters so nothing "sticks".
 watch(sheetMode, () => {
   sheetSearch.value = "";
-  activeRarity.value = "";
+  clearSheetFacets();
 });
 function selectPos(pos: string) {
   const changed = selected.value !== pos;
@@ -626,8 +658,95 @@ const rarityFacets = computed(() => {
     if (s.rarity) seen.set(s.rarity, RARITY_META[s.rarity.toLowerCase()]?.rank ?? 8);
   }
   // Least → greatest (Consumer first, Covert/★ last), like the game.
-  return [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([hex]) => ({ hex, name: rarityName(hex) }));
+  return [...seen.entries()]
+    .filter(([hex]) => sheetSkins.value.some((s) => s.rarity === hex && passGroup(s) && passCollection(s) && passTint(s)))
+    .sort((a, b) => a[1] - b[1])
+    .map(([hex]) => ({ hex, name: rarityName(hex) }));
 });
+
+// ---- catalog facets: group / collection / colourway -------------------------
+//
+// Graffiti is the catalog that needed these — 2,205 sprays, of which 384 are
+// tournament team crests you never want mixed into the art, and 1,767 are the
+// same 93 designs in 19 colourways each. Rarity can't separate any of that:
+// every tinted spray is Consumer.
+//
+// None of it is slot-aware. A control shows when the loaded catalog has more
+// than one value behind it and stays hidden otherwise, so every other weapon
+// sheet is unchanged without a single `if (slot === …)`.
+const passGroup = (s: Skin) => !sheetGroup.value || s.group === sheetGroup.value;
+const passCollection = (s: Skin) => !sheetCollection.value || s.collection === sheetCollection.value;
+const passTint = (s: Skin) => !sheetTint.value || s.tintName === sheetTint.value;
+
+// Counts move with the SEARCH, the way the attachment picker's do: typing
+// "astralis" should leave the Team Logos tab reading 1, not 384.
+const sheetSearched = computed(() => {
+  const q = sheetSearch.value.trim().toLowerCase();
+  return q ? sheetSkins.value.filter((s) => itemName(s).toLowerCase().includes(q)) : sheetSkins.value;
+});
+
+// Each facet is counted with the filters ABOVE it applied and its own ignored —
+// group, then collection, then colourway, then rarity. Counted with its own
+// filter on, a list would collapse to the single value you just picked and
+// there'd be no way to switch to another without clearing first.
+const sheetGroupTabs = computed(() => {
+  const counts = new Map<string, number>();
+  for (const s of sheetSearched.value) if (s.group) counts.set(s.group, (counts.get(s.group) ?? 0) + 1);
+  const tabs = sheetFacets.value.groups
+    .map((g) => ({ ...g, count: counts.get(g.value) ?? 0 }))
+    .filter((g) => g.count > 0);
+  // One tab is not a split. "All" goes last, after the useful ones.
+  return tabs.length > 1 ? [...tabs, { value: "", label: "All", count: sheetSearched.value.length }] : [];
+});
+const sheetCollectionOptions = computed(() => {
+  const counts = new Map<string, number>();
+  for (const s of sheetSearched.value) {
+    if (s.collection && passGroup(s)) counts.set(s.collection, (counts.get(s.collection) ?? 0) + 1);
+  }
+  if (counts.size < 2) return [];
+  // Insertion order = catalog order ≈ release order, which reads far better for
+  // capsules and events than alphabetical.
+  return [
+    { value: "", label: `All collections (${fmtCount([...counts.values()].reduce((n, c) => n + c, 0))})` },
+    ...[...counts].map(([value, count]) => ({ value, label: `${value} (${count})` })),
+  ];
+});
+const sheetTintOptions = computed(() => {
+  const counts = new Map<string, number>();
+  for (const s of sheetSearched.value) {
+    if (s.tintName && passGroup(s) && passCollection(s)) counts.set(s.tintName, (counts.get(s.tintName) ?? 0) + 1);
+  }
+  if (counts.size < 2) return [];
+  // Game order (red → white), not A→Z: that's how the colourways read as a set.
+  return [
+    { value: "", label: "All colors", color: null },
+    ...sheetFacets.value.tints
+      .filter((t) => counts.has(t.value))
+      .map((t) => ({ value: t.value, label: `${t.label} (${counts.get(t.value)})`, color: t.color })),
+  ];
+});
+// Narrowing cascade, same as the attachment picker: a collection you picked
+// under Art means nothing under Team Logos.
+function setSheetGroup(v: string) {
+  sheetGroup.value = v;
+  sheetCollection.value = "";
+  sheetTint.value = "";
+  sheetDesign.value = null;
+}
+function setSheetCollection(v: string) {
+  sheetCollection.value = v;
+  sheetTint.value = "";
+  sheetDesign.value = null;
+}
+function setSheetTint(v: string) {
+  sheetTint.value = v;
+  sheetDesign.value = null;
+}
+// The two filters that aren't behind a setter (both are v-model). Searching
+// while inside a stack would otherwise show an empty grid whose cause — the
+// stack you're still in — isn't among the controls you just touched.
+watch([sheetSearch, activeRarity], () => (sheetDesign.value = null));
+
 // Rarity facets for the Inventory grid — over what's OWNED, not a catalog.
 const invRarity = ref<string>("");
 const invRarityFacets = computed(() => {
@@ -792,22 +911,135 @@ const ownedForSheet = computed(() =>
     sheetDir.value,
   ),
 );
-// Sheet: ALL catalog skins for the weapon (craft mode).
+/**
+ * Fold colour variants of one artwork into a single card.
+ *
+ * 1,767 of the 2,205 sprays are 93 designs repeated in 19 colourways. As one
+ * tile each they bury the 438 that are actually distinct artwork, and finding
+ * "the green GGEZ" means reading nineteen near-identical names. Items sharing a
+ * `design` become one stacked card that says how many it holds; `drill` is the
+ * design being opened, and inside one the variants ARE the cards.
+ *
+ * Generic over what's being stacked because three grids need it — the craft
+ * sheet (catalog skins), the sheet's Owned tab and the inventory page (owned
+ * instances). Anything without a `design` — every weapon, knife and glove —
+ * comes through one card per item, so nothing outside graffiti changes.
+ *
+ * A stack survives the filters if ANY variant does, and drilling in shows only
+ * the survivors. That's why the colour filter needs no special case: pick one
+ * and every stack is down to a single variant, so the grid is flat again.
+ */
+interface Stack<T> {
+  key: string | number;
+  /** The item a single card equips, and the art a deck wears. */
+  face: T;
+  /** Two more colourways to fan out behind the face. Empty for a single. */
+  behind: string[];
+  variants: T[];
+}
+const TINT_SUFFIX = / \([^()]+\)\s*$/;
+const tintColors = computed(() => new Map(sheetFacets.value.tints.map((t) => [t.value, t.color])));
+function stackByDesign<T>(
+  list: T[],
+  drill: number | null,
+  of: (v: T) => { id: number; design?: number; tintName?: string } | null | undefined,
+): Stack<T>[] {
+  const out: Stack<T>[] = [];
+  const byDesign = new Map<number, Stack<T>>();
+  for (const v of list) {
+    const meta = of(v);
+    const design = meta?.design;
+    if (drill != null) {
+      if (design === drill) out.push({ key: meta?.id ?? out.length, face: v, behind: [], variants: [v] });
+      continue;
+    }
+    if (design == null) {
+      out.push({ key: meta?.id ?? out.length, face: v, behind: [], variants: [v] });
+      continue;
+    }
+    const stack = byDesign.get(design);
+    if (stack) {
+      stack.variants.push(v);
+      continue;
+    }
+    const next: Stack<T> = { key: `d${design}`, face: v, behind: [], variants: [v] };
+    byDesign.set(design, next);
+    out.push(next);
+  }
+  // Which colourway a deck WEARS. Taking the first survivor made a whole grid
+  // one colour — catalog order puts the same tint first for every design, so 93
+  // stacks all showed up Battle Green. Offsetting by the design id spreads them
+  // across the range, and stays deterministic so the colours don't reshuffle
+  // every time a filter changes.
+  for (const st of out) {
+    const n = st.variants.length;
+    if (n < 2) continue;
+    const at = (k: number) => st.variants[((((of(st.face)?.design ?? 0) + k) % n) + n) % n];
+    st.face = at(0);
+    // Thirds apart, so the two behind never repeat the face or each other.
+    st.behind = [at(Math.floor(n / 3)), at(Math.floor((2 * n) / 3))]
+      .map((v) => tintColors.value.get(of(v)?.tintName ?? "") ?? "")
+      .filter(Boolean);
+  }
+  return out;
+}
+
+const ownedStacks = computed(() => stackByDesign(ownedForSheet.value, sheetDesign.value, (i) => i.item));
+
+// Sheet: ALL catalog skins for the weapon (craft mode). The catalog facets only
+// live here — the Owned and Replace lists are inventory instances and weapons,
+// neither of which carries them.
 const craftList = computed(() =>
   sortSkins(
     sheetSkins.value.filter(
       // itemName folds in the phase, so "ruby" / "phase 2" find the right Doppler.
-      (s) => matchesFilters(itemName(s), s.rarity) && (selected.value !== "agent" || teamOk(s.teams)),
+      (s) =>
+        matchesFilters(itemName(s), s.rarity) &&
+        passGroup(s) &&
+        passCollection(s) &&
+        passTint(s) &&
+        (selected.value !== "agent" || teamOk(s.teams)),
     ),
     sheetSort.value,
     sheetDir.value,
   ),
 );
+
+/** Craft grid stacks, plus the name a deck shows: the face's, minus the
+ *  "(Colour)" that only distinguishes it from its own siblings. */
+const craftStacks = computed(() =>
+  stackByDesign(craftList.value, sheetDesign.value, (s) => s).map((st) => ({
+    ...st,
+    card: st.variants.length > 1 ? { ...st.face, name: st.face.name.replace(TINT_SUFFIX, "") } : st.face,
+  })),
+);
+
+/** The design being drilled into, for the back chip's label. */
+const sheetDesignName = computed(() =>
+  sheetDesign.value == null
+    ? ""
+    : stripName(sheetSkins.value.find((s) => s.design === sheetDesign.value)?.name ?? "").replace(TINT_SUFFIX, ""),
+);
+
 // Both sheet lists scroll rather than truncate. The reset key is every filter
 // that narrows them plus the slot itself — switching weapons is a new list.
-const sheetResetKey = () => [sheetKey.value, sheetMode.value, sheetSearch.value, activeRarity.value, sheetSort.value, sheetDir.value, sheetOrigin.value].join("|");
-const ownedWindow = renderWindow(ownedForSheet, sheetResetKey);
-const craftWindow = renderWindow(craftList, sheetResetKey);
+const sheetResetKey = () =>
+  [
+    sheetKey.value,
+    sheetMode.value,
+    sheetSearch.value,
+    activeRarity.value,
+    sheetGroup.value,
+    sheetCollection.value,
+    sheetTint.value,
+    sheetDesign.value,
+    sheetSort.value,
+    sheetDir.value,
+    sheetOrigin.value,
+  ].join("|");
+// Both windows count CARDS, not items — a stack is one thing to scroll past.
+const ownedWindow = renderWindow(ownedStacks, sheetResetKey);
+const craftWindow = renderWindow(craftStacks, sheetResetKey);
 // Sheet: replace mode — every weapon eligible for this position (defaults are
 // free) plus owned skins of those weapons.
 const replaceOptions = computed(() => {
@@ -1145,6 +1377,16 @@ const craft = ref<{
    *  charm geometry or art by it, so the 3D viewer never sees it. */
   charm: (Attach & { z?: number | null; seed?: number | null }) | null;
 } | null>(null);
+/**
+ * Does the editor's right-hand column have anything IN it?
+ *
+ * Every box in there — name tag, attachment slots, pattern, wear, StatTrak —
+ * is gated per slot, and for graffiti every one of those gates is closed. The
+ * column still claimed its 300px, so the preview centred itself in what was
+ * left and a spray sat visibly off to the left of an empty panel. Hidden, the
+ * preview takes the whole modal.
+ */
+const craftHasOptions = computed(() => selected.value !== "graffiti");
 // What attachments the selected slot's item supports.
 const attachKind = computed<"weapon" | "agent" | "none">(() => {
   if (selected.value === "agent") return "agent";
@@ -2011,6 +2253,7 @@ async function mountModalViewer() {
       stattrak: craft.value?.stattrak
         ? { count: inventory.value.find((i) => i.id === craftInstId.value)?.stattrak_count ?? 0 }
         : null,
+      nametag: craft.value?.nametag ?? null,
       // Drags write straight into the craft form — the numeric inputs follow
       // live, and confirm sends the same offsets to the game server.
       onStickerPlaced(slot, x, y) {
@@ -2101,6 +2344,16 @@ watch(
         ? { count: inventory.value.find((i) => i.id === craftInstId.value)?.stattrak_count ?? 0 }
         : null,
     );
+  },
+);
+// Name tag → swap the engraved plate on the live viewer. Its own watcher for
+// the same reason StatTrak has one: the plate is independent of the paint
+// composite, so remounting to show it would reset the camera mid-keystroke.
+watch(
+  () => craft.value?.nametag,
+  (text) => {
+    if (!modalViewerHandle || !craft.value) return;
+    modalViewerHandle.setNameTag(text ?? null);
   },
 );
 // Numeric edits / picker changes → live decal + charm updates. The viewer
@@ -2628,6 +2881,7 @@ const modal3dPill = makePill();
 const sheetOriginPill = makePill();
 const focus3dPill = makePill();
 const pickerGroupPill = makePill();
+const sheetGroupPill = makePill();
 function syncAllPills() {
   viewPill.sync(view.value);
   sheetPill.sync(sheetMode.value);
@@ -2636,6 +2890,7 @@ function syncAllPills() {
   modal3dPill.sync(modal3d.value ? "3D" : "2D");
   sheetOriginPill.sync(sheetOrigin.value);
   focus3dPill.sync(focus3d.value ? "3D" : "2D");
+  sheetGroupPill.sync(sheetGroup.value);
 }
 // immediate: seeds the pill's active key before the modal ever opens, so the
 // ResizeObserver's initial fire on mount can position the indicator itself.
@@ -2644,6 +2899,12 @@ watch(modal3d, () => nextTick(() => modal3dPill.sync(modal3d.value ? "3D" : "2D"
 // existence (Replace only on weapon slots).
 watch([sheetMode, selected, () => inventory.value.length], () => nextTick(() => sheetPill.sync(sheetMode.value)));
 watch([team, view], () => nextTick(syncAllPills));
+// Same reason as the picker's group pill: the tab list arrives with the catalog
+// and only exists for some of them, so the indicator has to follow the list as
+// well as the selection.
+watch([sheetGroup, sheetGroupTabs], () => nextTick(() => sheetGroupPill.sync(sheetGroup.value)), {
+  immediate: true,
+});
 
 const linkOpening = ref(false);
 // Hands a steam:// inspect link to the OS, which launches CS2 straight into
@@ -2952,22 +3213,27 @@ const filterSheetSwipe = swipeToDismiss(() => (sheetFiltersOpen.value = false));
 const sheetFilterCount = computed(
   () =>
     (activeRarity.value ? 1 : 0) +
+    // The tab it opened on isn't a filter you set, so it isn't one to clear.
+    (sheetGroup.value !== sheetDefaultGroup.value ? 1 : 0) +
+    (sheetCollection.value ? 1 : 0) +
+    (sheetTint.value ? 1 : 0) +
     (sheetOrigin.value !== "all" ? 1 : 0) +
     (sheetSort.value !== DEFAULT_SORT ? 1 : 0) +
     (sheetSearch.value.trim() ? 1 : 0),
 );
 // Live count behind the sheet's confirm button, so you can tell a filter
-// combination returns nothing before dismissing the sheet to find out.
+// combination returns nothing before dismissing the sheet to find out. Craft
+// counts CARDS — that's what the grid puts on screen, and a stack is one card.
 const sheetResultCount = computed(() =>
   sheetMode.value === "owned"
-    ? ownedForSheet.value.length
+    ? ownedStacks.value.length
     : sheetMode.value === "craft"
-      ? craftList.value.length
+      ? craftStacks.value.length
       : replaceOptions.value.defaults.length + replaceOptions.value.owned.length,
 );
 function resetSheetFilters() {
   sheetSearch.value = "";
-  activeRarity.value = "";
+  clearSheetFacets();
   sheetOrigin.value = "all";
   sheetSort.value = DEFAULT_SORT;
 }
@@ -3436,6 +3702,19 @@ function setSheetScrollEl(el: unknown) {
   if (sheetScrollEl) requestAnimationFrame(() => measureSheetScroll(sheetScrollEl));
   else sheetHasMore.value = false;
 }
+// Opening a colour stack replaces the grid under a scroll position that meant
+// something in the OLD list — open one from the bottom of 93 stacks and the
+// nineteen colours land above the fold, off screen. Go to the top for the new
+// list, and put the old position back on the way out so leaving a stack doesn't
+// also lose your place in the grid you opened it from.
+let stackReturnScroll = 0;
+watch(sheetDesign, (design, prev) => {
+  if (design !== null && prev === null) stackReturnScroll = sheetScrollEl?.scrollTop ?? 0;
+  const to = design === null ? stackReturnScroll : 0;
+  // After the new cards render, or the scroller is still the height of the old
+  // list and clamps the restore.
+  requestAnimationFrame(() => sheetScrollEl?.scrollTo({ top: to }));
+});
 // The window grows as you scroll (InfiniteSentinel) and shrinks as you filter;
 // both change whether there's more below without any scroll event firing.
 watch(
@@ -3497,7 +3776,7 @@ function scrollFade() {
 const invFade = scrollFade();
 // cardSize is watched separately, down where it's declared — it changes row
 // heights, so it changes whether there's more below.
-watch([() => inventoryWindow.items.value.length, () => filteredInventory.value.length], invFade.remeasure);
+watch([() => inventoryWindow.items.value.length, () => inventoryStacks.value.length], invFade.remeasure);
 
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
 // pulls the rail to the category that actually contains it — otherwise the
@@ -3800,8 +4079,25 @@ const filteredInventory = computed(() => {
     invDir.value,
   );
 });
-const inventoryWindow = renderWindow(filteredInventory, () =>
-  [invSearch.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join(".")].join("|"),
+// Colour stacks here too — the inventory page is where you LOOK at what you
+// own, and nineteen tints of one spray is the same wall there as in the picker.
+// Its own drill-in state, not the sheet's: the two grids are different screens
+// and being inside a stack on one says nothing about the other.
+const invDesign = ref<number | null>(null);
+const inventoryStacks = computed(() => stackByDesign(filteredInventory.value, invDesign.value, (i) => i.item));
+const invDesignName = computed(() =>
+  invDesign.value == null
+    ? ""
+    : stripName(
+        inventory.value.find((i) => i.item?.design === invDesign.value)?.item?.name ?? "",
+      ).replace(TINT_SUFFIX, ""),
+);
+// Any filter change drops you out of the stack — you can't stay inside a card
+// the filters just removed. (Entering select mode does too; that watch lives
+// with selectMode, which is declared further down.)
+watch([invSearch, invOrigin, invRarity, invTypes, invModels], () => (invDesign.value = null));
+const inventoryWindow = renderWindow(inventoryStacks, () =>
+  [invSearch.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
 );
 function canEquipInstance(i: InventoryItem): boolean {
   if (!i.slot) return false;
@@ -4322,6 +4618,9 @@ async function load() {
       inventory.value = inv;
       loadSkins(sheetKey.value);
       queueLoadoutRenders();
+      // Off to the side: the nag dot is the least important thing on screen and
+      // must never hold up (or fail) the load it rides along with.
+      void loadSteamSyncState();
     }
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -4584,11 +4883,30 @@ const craftShareLinks = computed<ShareLink[]>(() => {
 
 // ---- Steam import (read-only public data; no credentials ever) ----
 const importBusy = ref(false);
+
+// Has this account ever pulled from Steam? Starts true so the nag can only ever
+// appear once the answer is known — a dot that flashes on every load and then
+// vanishes is worse than one that shows up a beat late. Stays true if the
+// endpoint is missing (older backend) or errors: better to nag nobody than to
+// nag everybody with a false one.
+const steamSynced = ref(true);
+const needsSteamSync = computed(() => signedIn.value && !viewerId.value && !steamSynced.value);
+async function loadSteamSyncState() {
+  try {
+    const { syncedAt } = await fetchSteamSync();
+    steamSynced.value = syncedAt != null;
+  } catch {
+    steamSynced.value = true;
+  }
+}
+
 async function runSteamImport() {
   if (importBusy.value) return;
   importBusy.value = true;
   try {
     const { imported, updated, removed, skipped, partial } = await importSteamInventory();
+    // The server recorded the sync; drop the nag without a round trip to ask.
+    steamSynced.value = true;
     await refreshAll();
     const parts = [
       imported && `${imported} added`,
@@ -4625,6 +4943,9 @@ const selectMode = ref(false);
 // pill has to re-measure when it comes back.
 watch(selectMode, (v) => {
   if (!v) nextTick(() => invOriginPill.sync(invOrigin.value));
+  // Bulk actions operate on instances and a colour deck isn't one, so selecting
+  // starts from the flat grid.
+  invDesign.value = null;
 });
 const selectedIds = ref<Set<number>>(new Set());
 function toggleSelected(id: number) {
@@ -4870,18 +5191,33 @@ if (MDEBUG) {
                inventory, not on what the toolbar's filters are showing, and
                down there its label was the widest thing in the row — the one
                control that forced the filters onto a second line. -->
+          <!-- Never synced: the button gets an orange dot and the tooltip turns
+               into the pitch. Nothing else on an empty inventory says where the
+               skins you already own are supposed to come from. -->
           <Tooltip
             v-if="!viewerId"
-            text="Sync from Steam — read-only: mirrors your public Steam inventory. No passwords, keys, or trades, ever."
+            :text="needsSteamSync
+              ? 'You haven\'t synced with Steam yet — click to pull the skins you already own into your inventory. Read-only: it mirrors your public Steam inventory. No passwords, keys, or trades, ever.'
+              : 'Sync from Steam — read-only: mirrors your public Steam inventory. No passwords, keys, or trades, ever.'"
           >
             <button
-              class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
-              :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
+              class="relative grid place-items-center rounded-md border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
+              :class="[
+                isCompact ? 'h-8 w-8' : 'h-9 w-9',
+                needsSteamSync ? 'border-[#f97316]/60' : 'border-border',
+              ]"
               :disabled="importBusy"
               @click="runSteamImport"
             >
               <Loader2 v-if="importBusy" class="h-3.5 w-3.5 animate-spin" />
               <RefreshCw v-else class="h-3.5 w-3.5" :style="{ color: STEAM_BLUE }" />
+              <!-- Same badge geometry as the admin gear's warning dot, so the
+                   two read as one language of "this wants your attention". -->
+              <span
+                v-if="needsSteamSync && !importBusy"
+                class="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full"
+                style="background: #f97316; box-shadow: 0 0 6px #f9731699"
+              ></span>
             </button>
           </Tooltip>
           <ShareMenu icon :links="viewShareLinks" />
@@ -5385,11 +5721,35 @@ if (MDEBUG) {
         <!-- Wrapper exists purely to anchor the fade: the grid itself is the
              scroller, so the overlay cannot live inside it (it would scroll
              with the content) and the row above holds the filter rail too. -->
-        <div :ref="invFade.setHost" class="relative flex min-w-0 flex-1">
+        <div :ref="invFade.setHost" class="relative flex min-w-0 flex-1 flex-col">
+        <!-- Inside a colour stack. Above the grid rather than in it: the grid's
+             rows are a fixed card height, so a col-span-full header reserves a
+             whole card-tall row for an 8px button. -->
+        <div
+          v-if="invDesign !== null"
+          class="flex flex-none items-center gap-3 border-b border-border px-6 py-2.5"
+        >
+          <button
+            class="flex h-8 flex-none items-center gap-1.5 rounded-md border px-3 text-f10 font-semibold uppercase tracking-cs1 text-foreground transition-colors"
+            :style="{
+              borderColor: 'hsl(var(--tac-amber, 33 94% 58%) / 0.55)',
+              background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
+            }"
+            @click="invDesign = null"
+          >
+            <ChevronLeft class="h-4 w-4" />
+            Back
+          </button>
+          <span class="min-w-0 truncate text-f11 uppercase tracking-cs2 text-foreground">{{ invDesignName }}</span>
+          <span class="flex-none text-f9 uppercase tracking-cs1 text-muted-foreground">
+            <span class="font-mono text-foreground">{{ inventoryStacks.length }}</span>
+            {{ inventoryStacks.length === 1 ? 'color' : 'colors' }}
+          </span>
+        </div>
         <TransitionGroup
           data-scroller
           tag="div"
-          class="min-w-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto p-6"
+          class="min-h-0 min-w-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto p-6"
           :style="invGridStyle"
           move-class="inv-move"
           enter-active-class="animate-fade-in"
@@ -5401,7 +5761,7 @@ if (MDEBUG) {
             <div class="text-f13">Open the <b class="text-foreground">Loadout</b>, pick a weapon, and craft a finish.</div>
           </div>
           <div
-            v-else-if="!filteredInventory.length"
+            v-else-if="!inventoryStacks.length"
             key="no-match"
             class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground"
           >
@@ -5417,23 +5777,65 @@ if (MDEBUG) {
           </div>
           <!-- A click OPENS the item (see it big, then decide). Equipping moved
                into the detail modal so a stray click can't re-equip a slot. -->
-          <ItemTile
-            v-for="i in inventoryWindow.items.value"
-            :key="i.id"
-            :inst="i"
-            show-header
-            :selected="selectMode && selectedIds.has(i.id)"
-            :hide-actions="selectMode"
-            :title="selectMode ? 'Toggle selection' : itemName(i.item) || 'View item'"
-            @click="selectMode ? toggleSelected(i.id) : openDetail(i)"
-            @contextmenu.prevent="openItemCtx(i, $event)"
-            @longpress="openItemCtxFor(i)"
-            @view3d="view3dForInstance(i)"
-            @inspect="openInspectLink(i.id)"
-            @edit="openEdit(i)"
-            @duplicate="openEdit(i)"
-            @remove="deleteOwned(i)"
-          />
+          <template v-for="st in inventoryWindow.items.value" :key="st.key">
+            <!-- A deck is not an item: no single instance to open, select or
+                 act on, so its only verb is "open me". Selecting is done inside
+                 it, where the instances are. -->
+            <div v-if="st.variants.length > 1" class="relative h-full">
+              <span
+                v-for="(hex, n) in st.behind"
+                :key="hex"
+                class="pointer-events-none absolute inset-0 rounded-lg border"
+                :style="{
+                  transform: `rotate(${n === 0 ? -5 : 5}deg) scale(0.88)`,
+                  transformOrigin: 'bottom center',
+                  borderColor: hex,
+                  background: `color-mix(in srgb, ${hex} 70%, hsl(var(--card)))`,
+                }"
+              ></span>
+              <button
+                data-role="inv-item"
+                class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
+                :style="st.face.item?.rarity ? { borderBottom: `3px solid ${st.face.item.rarity}` } : {}"
+                :title="`${st.variants.length} colours — open`"
+                @click="invDesign = st.face.item?.design ?? null"
+              >
+                <span class="pointer-events-none absolute inset-0" :style="glowStyle(st.face.item?.rarity, 0.22)"></span>
+                <span class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 font-mono text-f8 text-[color:var(--acc)]">
+                  <Palette class="h-2.5 w-2.5" /> {{ st.variants.length }}
+                </span>
+                <div :class="CARD_ART">
+                  <img
+                    :src="st.face.item?.image ?? undefined"
+                    alt=""
+                    loading="lazy"
+                    class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
+                  />
+                </div>
+                <ItemName
+                  :item="{ ...st.face.item, name: (st.face.item?.name ?? '').replace(TINT_SUFFIX, '') }"
+                  strip
+                  class="relative z-[2]"
+                />
+              </button>
+            </div>
+            <ItemTile
+              v-else
+              :inst="st.face"
+              show-header
+              :selected="selectMode && selectedIds.has(st.face.id)"
+              :hide-actions="selectMode"
+              :title="selectMode ? 'Toggle selection' : itemName(st.face.item) || 'View item'"
+              @click="selectMode ? toggleSelected(st.face.id) : openDetail(st.face)"
+              @contextmenu.prevent="openItemCtx(st.face, $event)"
+              @longpress="openItemCtxFor(st.face)"
+              @view3d="view3dForInstance(st.face)"
+              @inspect="openInspectLink(st.face.id)"
+              @edit="openEdit(st.face)"
+              @duplicate="openEdit(st.face)"
+              @remove="deleteOwned(st.face)"
+            />
+          </template>
           <!-- Keyed: TransitionGroup requires it, and a stable key keeps the
                sentinel out of the move/enter animations. -->
           <InfiniteSentinel
@@ -5605,7 +6007,7 @@ if (MDEBUG) {
                     name-class="text-f11 font-medium"
                     class="min-w-0 flex-1"
                   />
-                  <WearBar :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
+                  <WearBar :item="rowFor(s.slot)?.item" :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
                 </div>
               </button>
             </div>
@@ -5649,7 +6051,7 @@ if (MDEBUG) {
                 </div>
                 <div class="relative z-[2] flex items-end justify-between gap-2">
                   <ItemName :item="cellItem(cell.pos)" strip fallback="Default" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
-                  <WearBar :wear="cellWear(cell.pos)?.wear" :seed="cellWear(cell.pos)?.seed" mini class="mb-1" />
+                  <WearBar :item="cellWear(cell.pos)?.item" :wear="cellWear(cell.pos)?.wear" :seed="cellWear(cell.pos)?.seed" mini class="mb-1" />
                 </div>
               </button>
             </div>
@@ -5721,7 +6123,7 @@ if (MDEBUG) {
                   name-class="text-f11 font-medium"
                   class="min-w-0 flex-1"
                 />
-                <WearBar :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
+                <WearBar :item="rowFor(s.slot)?.item" :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
               </div>
             </button>
             <button
@@ -5866,12 +6268,13 @@ if (MDEBUG) {
                           @click.stop="view3dForInstance(cellInstance(cell.pos)!)"
                         ><Box class="h-3 w-3" /></span>
                         <span
-                          v-if="!isCoarse"
+                          v-if="!isCoarse && canInspect(cellInstance(cell.pos)?.item)"
                           class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
                           title="Inspect in game"
                           @click.stop="openInspectLink(cellInstance(cell.pos)!.id)"
                         ><ExternalLink class="h-3 w-3" /></span>
                         <span
+                          v-if="isCustomizable(cellInstance(cell.pos)?.item)"
                           class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
                           title="Edit item"
                           @click.stop="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
@@ -5919,6 +6322,7 @@ if (MDEBUG) {
                       class="min-w-0 flex-1"
                     />
                     <WearBar
+                      :item="cellWear(previewPos(cell.pos))?.item"
                       :wear="cellWear(previewPos(cell.pos))?.wear"
                       :seed="cellWear(previewPos(cell.pos))?.seed"
                       mini
@@ -6005,7 +6409,7 @@ if (MDEBUG) {
                      the only way into the editor from here was the context menu
                      or a trip back to the grid. -->
                 <button
-                  v-if="isSkinned(focusRow) && canEdit && focusInstance"
+                  v-if="isSkinned(focusRow) && canEdit && focusInstance && isCustomizable(focusRow?.item)"
                   :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
                   title="Edit this item — wear, pattern, stickers, charm"
                   @click="openEdit(focusInstance)"
@@ -6013,7 +6417,7 @@ if (MDEBUG) {
                   <Pencil class="h-3.5 w-3.5" /> Edit
                 </button>
                 <button
-                  v-if="isSkinned(focusRow) && canEdit && focusInstance && !isCoarse"
+                  v-if="isSkinned(focusRow) && canEdit && focusInstance && !isCoarse && canInspect(focusRow?.item)"
                   :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
                   title="Launch CS2 and inspect this item in-game"
                   @click="openInspectLink(focusInstance.id)"
@@ -6080,7 +6484,11 @@ if (MDEBUG) {
             </div>
 
             <div class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5">
-              <div class="flex flex-col gap-1">
+              <!-- Hidden, not dashed out, for the types that have no such
+                   reading: a spray has no float and no pattern, and "—" under a
+                   Float heading still says the item HAS one and we don't know
+                   it. -->
+              <div v-if="hasWear(focusRow?.item)" class="flex flex-col gap-1">
                 <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Float</span>
                 <span class="font-mono text-f13">{{ focusRow?.wear != null ? focusRow.wear.toFixed(4) : '—' }}</span>
                 <!-- Was a hand-rolled track: full-saturation ramp, no tier
@@ -6088,9 +6496,9 @@ if (MDEBUG) {
                      app that didn't look like the others. WearBar is THE way
                      wear renders — bare drops its numbers, since "Float" above
                      already prints the value. -->
-                <WearBar v-if="focusRow?.wear != null" :wear="focusRow.wear" bare class="mt-1.5 w-[180px]" />
+                <WearBar v-if="focusRow?.wear != null" :item="focusRow?.item" :wear="focusRow.wear" bare class="mt-1.5 w-[180px]" />
               </div>
-              <div class="flex flex-col gap-1">
+              <div v-if="hasSeed(focusRow?.item)" class="flex flex-col gap-1">
                 <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Pattern</span>
                 <span class="font-mono text-f13">{{ focusRow?.seed != null ? '#' + focusRow.seed : '—' }}</span>
               </div>
@@ -6208,6 +6616,56 @@ if (MDEBUG) {
               Craft
             </button>
           </div>
+          <!-- Catalog facets. Craft only — Owned and Replace list inventory
+               instances and weapons, which carry none of this — and each one
+               hides itself when the loaded catalog has nothing to split, so
+               only graffiti shows them today and no weapon sheet changed.
+               Same sliding-pill tabs as every other tab group here. -->
+          <div
+            v-if="sheetMode === 'craft' && sheetGroupTabs.length && (!isCompact || sheetFiltersOpen)"
+            :ref="(el) => sheetGroupPill.setListEl(el)"
+            class="relative inline-flex h-8 flex-none items-center rounded-lg bg-muted p-1"
+          >
+            <div
+              v-show="sheetGroupPill.w.value > 0"
+              class="pointer-events-none absolute left-0 z-0 rounded-md"
+              :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
+              :style="{
+                transform: `translateX(${sheetGroupPill.x.value}px)`,
+                width: sheetGroupPill.w.value + 'px',
+                border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
+                background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
+                boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
+                transition: sheetGroupPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+              }"
+            ></div>
+            <button
+              v-for="g in sheetGroupTabs"
+              :key="g.value"
+              :ref="(el) => sheetGroupPill.setRef(g.value, el)"
+              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
+              :class="sheetGroup === g.value ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
+              @click="setSheetGroup(g.value)"
+            >
+              {{ g.label }}
+              <span class="ml-1.5 inline-flex h-[15px] min-w-[20px] items-center justify-center rounded border border-border bg-background/70 px-1.5 font-mono text-f9 leading-none">{{ fmtCount(g.count) }}</span>
+            </button>
+          </div>
+          <FilterDropdown
+            v-if="sheetMode === 'craft' && sheetCollectionOptions.length && (!isCompact || sheetFiltersOpen)"
+            :model-value="sheetCollection"
+            :options="sheetCollectionOptions"
+            @update:model-value="setSheetCollection"
+          />
+          <!-- Colourways. The dot is an approximation of the tint (see
+               GRAFFITI_TINT_HEX) — the label is what identifies it. -->
+          <FilterDropdown
+            v-if="sheetMode === 'craft' && sheetTintOptions.length && (!isCompact || sheetFiltersOpen)"
+            :model-value="sheetTint"
+            dots
+            :options="sheetTintOptions"
+            @update:model-value="setSheetTint"
+          />
           <!-- Rarity filter: ranks show their colors, ordered least → greatest. -->
           <FilterDropdown
             v-if="sheetMode !== 'replace' && rarityFacets.length && (!isCompact || sheetFiltersOpen)"
@@ -6389,6 +6847,68 @@ if (MDEBUG) {
                 ><X class="h-4 w-4" /></button>
               </div>
 
+              <!-- Catalog facets, same three the desktop toolbar shows and on
+                   the same "only if the catalog splits" condition. Chips rather
+                   than dropdowns: a menu inside a bottom sheet inside a sheet is
+                   one popover too many on a phone. -->
+              <section v-if="sheetMode === 'craft' && sheetGroupTabs.length" class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs3 text-muted-foreground/60">Type</div>
+                <div class="flex flex-wrap gap-1.5">
+                  <button
+                    v-for="g in sheetGroupTabs"
+                    :key="g.value"
+                    class="flex items-center gap-1.5 rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors"
+                    :class="sheetGroup === g.value ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground'"
+                    :style="sheetGroup === g.value ? { background: accentSoft } : {}"
+                    @click="setSheetGroup(g.value)"
+                  >
+                    {{ g.label }}
+                    <span class="font-mono text-f9 text-muted-foreground/70">{{ fmtCount(g.count) }}</span>
+                  </button>
+                </div>
+              </section>
+
+              <section v-if="sheetMode === 'craft' && sheetCollectionOptions.length" class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs3 text-muted-foreground/60">Collection</div>
+                <div class="flex flex-wrap gap-1.5">
+                  <button
+                    v-for="c in sheetCollectionOptions"
+                    :key="c.value"
+                    class="rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors"
+                    :class="sheetCollection === c.value ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground'"
+                    :style="sheetCollection === c.value ? { background: accentSoft } : {}"
+                    @click="setSheetCollection(c.value)"
+                  >
+                    {{ c.value ? c.label : 'All' }}
+                  </button>
+                </div>
+              </section>
+
+              <section v-if="sheetMode === 'craft' && sheetTintOptions.length" class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs3 text-muted-foreground/60">Color</div>
+                <div class="flex flex-wrap gap-1.5">
+                  <button
+                    v-for="t in sheetTintOptions"
+                    :key="t.value"
+                    class="flex items-center gap-1.5 rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors"
+                    :class="sheetTint === t.value ? 'text-foreground' : 'border-border/60 text-muted-foreground'"
+                    :style="sheetTint === t.value
+                      ? t.color
+                        ? { borderColor: t.color, background: `color-mix(in srgb, ${t.color} 16%, transparent)` }
+                        : { borderColor: 'var(--acc)', background: accentSoft }
+                      : {}"
+                    @click="setSheetTint(t.value)"
+                  >
+                    <span
+                      v-if="t.color"
+                      class="h-2 w-2 flex-none rounded-full"
+                      :style="{ background: t.color, boxShadow: `0 0 6px ${t.color}` }"
+                    ></span>
+                    {{ t.value ? t.label : 'All' }}
+                  </button>
+                </div>
+              </section>
+
               <section v-if="sheetMode !== 'replace' && rarityFacets.length" class="flex flex-col gap-2">
                 <div class="text-f9 uppercase tracking-cs3 text-muted-foreground/60">Rarity</div>
                 <div class="flex flex-wrap gap-1.5">
@@ -6479,6 +6999,38 @@ if (MDEBUG) {
         </div>
         </Transition>
 
+        <!-- Inside a colour stack. Its own strip rather than a cell in the grid:
+             the grid's rows are a fixed card height, so a col-span-full header
+             left a card-tall hole above the results.
+             Unfilled, like the compact tally strip below the toolbar — a band of
+             flat colour is a weight nothing else in this app carries.
+             Tactical amber rather than var(--acc): the team accent turns CS2
+             blue on CT, which put a blue control directly under the amber CRAFT
+             and ART pills that own this row. Amber is what this UI uses for
+             "the thing you act on". -->
+        <div
+          v-if="sheetMode !== 'replace' && sheetDesign !== null"
+          class="flex flex-none items-center gap-3 border-b border-border"
+          :class="isCompact ? 'px-3 py-2' : 'px-6 py-2.5'"
+        >
+          <button
+            class="flex h-8 flex-none items-center gap-1.5 rounded-md border px-3 text-f10 font-semibold uppercase tracking-cs1 text-foreground transition-colors"
+            :style="{
+              borderColor: 'hsl(var(--tac-amber, 33 94% 58%) / 0.55)',
+              background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
+            }"
+            @click="sheetDesign = null"
+          >
+            <ChevronLeft class="h-4 w-4" />
+            Back
+          </button>
+          <span class="min-w-0 truncate text-f11 uppercase tracking-cs2 text-foreground">{{ sheetDesignName }}</span>
+          <span class="flex-none text-f9 uppercase tracking-cs1 text-muted-foreground">
+            <span class="font-mono text-foreground">{{ sheetResultCount }}</span>
+            {{ sheetResultCount === 1 ? 'color' : 'colors' }}
+          </span>
+        </div>
+
         <Transition
           mode="out-in"
           enter-active-class="transition duration-150"
@@ -6547,28 +7099,70 @@ if (MDEBUG) {
                  On touch a tap opens the action menu instead: instant-equip
                  plus fingernail-sized hover icons made the tiles a minefield,
                  and the menu's Equip rows are the same one tap anyway. -->
-            <ItemTile
-              v-for="(i, idx) in ownedWindow.items.value"
-              :key="i.id"
-              :inst="i"
-              class="animate-sheet-in"
-              :style="{ '--i': idx + 2 }"
-              draggable="true"
-              @dragstart="onTileDragStart(i, $event)"
-              @dragend="onTileDragEnd"
-              strip-weapon-name
-              show-header
-              :row="sheetRows"
-              :active="String(rowFor(selected)?.item_instance_id) === String(i.id)"
-              @click="tapOpensMenu ? openItemCtxFor(i) : equipInstanceAt(i, selected)"
-              @contextmenu.prevent="openItemCtx(i, $event)"
-            @longpress="openItemCtxFor(i)"
-              @view3d="view3dForInstance(i)"
-              @inspect="openInspectLink(i.id)"
-              @edit="openEdit(i)"
-              @duplicate="openEdit(i)"
-              @remove="deleteOwned(i)"
-            />
+            <template v-for="(st, idx) in ownedWindow.items.value" :key="st.key">
+              <!-- A deck is not an item: it has no float to drag onto a slot and
+                   no single instance to equip, so it gets a plain card whose only
+                   verb is "open me" rather than an ItemTile with actions that
+                   would each need an owner. -->
+              <div v-if="st.variants.length > 1" class="animate-sheet-in relative h-full" :style="{ '--i': idx + 2 }">
+                <span
+                  v-for="(hex, i) in st.behind"
+                  :key="hex"
+                  class="pointer-events-none absolute inset-0 rounded-lg border"
+                  :style="{
+                    transform: `rotate(${i === 0 ? -5 : 5}deg) scale(0.88)`,
+                    transformOrigin: 'bottom center',
+                    borderColor: hex,
+                    background: `color-mix(in srgb, ${hex} 70%, hsl(var(--card)))`,
+                  }"
+                ></span>
+                <button
+                  data-role="skin"
+                  class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
+                  :style="st.face.item?.rarity ? { borderBottom: `3px solid ${st.face.item.rarity}` } : {}"
+                  @click="sheetDesign = st.face.item?.design ?? null"
+                >
+                  <span class="pointer-events-none absolute inset-0" :style="glowStyle(st.face.item?.rarity, 0.22)"></span>
+                  <span class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 font-mono text-f8 text-[color:var(--acc)]">
+                    <Palette class="h-2.5 w-2.5" /> {{ st.variants.length }}
+                  </span>
+                  <div :class="CARD_ART">
+                    <img
+                      :src="st.face.item?.image ?? undefined"
+                      alt=""
+                      loading="lazy"
+                      class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
+                    />
+                  </div>
+                  <ItemName
+                    :item="{ ...st.face.item, name: (st.face.item?.name ?? '').replace(TINT_SUFFIX, '') }"
+                    strip
+                    class="relative z-[2]"
+                  />
+                </button>
+              </div>
+              <ItemTile
+                v-else
+                :inst="st.face"
+                class="animate-sheet-in"
+                :style="{ '--i': idx + 2 }"
+                draggable="true"
+                @dragstart="onTileDragStart(st.face, $event)"
+                @dragend="onTileDragEnd"
+                strip-weapon-name
+                show-header
+                :row="sheetRows"
+                :active="String(rowFor(selected)?.item_instance_id) === String(st.face.id)"
+                @click="tapOpensMenu ? openItemCtxFor(st.face) : equipInstanceAt(st.face, selected)"
+                @contextmenu.prevent="openItemCtx(st.face, $event)"
+                @longpress="openItemCtxFor(st.face)"
+                @view3d="view3dForInstance(st.face)"
+                @inspect="openInspectLink(st.face.id)"
+                @edit="openEdit(st.face)"
+                @duplicate="openEdit(st.face)"
+                @remove="deleteOwned(st.face)"
+              />
+            </template>
             <InfiniteSentinel
               :count="ownedWindow.items.value.length"
               :done="ownedWindow.done.value"
@@ -6582,35 +7176,73 @@ if (MDEBUG) {
               <Loader2 class="h-4 w-4 animate-spin" /> Loading finishes…
             </div>
             <template v-else>
-              <button
-                v-for="(s, idx) in craftWindow.items.value"
-                :key="s.id"
-                data-role="skin"
-                class="group animate-sheet-in relative flex h-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
-                :style="[{ '--i': idx }, s.rarity ? { borderBottom: `3px solid ${s.rarity}` } : {}]"
-                @click="openCraft(s)"
+              <!-- The wrapper exists so the "deck" layers can sit OUTSIDE the
+                   card: the card itself is overflow-hidden (the art scales on
+                   hover) and would clip them. -->
+              <div
+                v-for="(st, idx) in craftWindow.items.value"
+                :key="st.key"
+                class="animate-sheet-in relative h-full"
+                :style="{ '--i': idx }"
               >
-                <span class="pointer-events-none absolute inset-0" :style="glowStyle(s.rarity, 0.22)"></span>
-                <span class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 text-f8 uppercase text-[color:var(--acc)] opacity-0 transition-opacity group-hover:opacity-100">
-                  <Hammer class="h-2.5 w-2.5" /> Craft
-                </span>
-                <div :class="CARD_ART">
-                  <img
-                    :src="s.image ?? undefined"
-                    alt=""
-                    loading="lazy"
-                    class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
-                    :class="sheetKey === 'agent' && ART_FADE_B"
-                  />
-                </div>
-                <ItemName :item="s" strip class="relative z-[2]" />
-              </button>
+                <!-- Fanned out from the bottom edge and wearing two of the
+                     OTHER colourways, so a stack says "this also comes in
+                     nineteen colours" without having to be read.
+                     The scale is what keeps it neighbourly: the card fills its
+                     whole grid cell, so anything visible behind it is out in
+                     the gap, and 0.88 at 5° puts the corners ~5px out — half
+                     the gap, so two adjacent stacks never touch. Saturated,
+                     because 5px of a wash is 5px of nothing. -->
+                <span
+                  v-for="(hex, i) in st.behind"
+                  :key="hex"
+                  class="pointer-events-none absolute inset-0 rounded-lg border"
+                  :style="{
+                    transform: `rotate(${i === 0 ? -5 : 5}deg) scale(0.88)`,
+                    transformOrigin: 'bottom center',
+                    borderColor: hex,
+                    background: `color-mix(in srgb, ${hex} 70%, hsl(var(--card)))`,
+                  }"
+                ></span>
+                <button
+                  data-role="skin"
+                  class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
+                  :style="st.face.rarity ? { borderBottom: `3px solid ${st.face.rarity}` } : {}"
+                  @click="st.variants.length > 1 ? (sheetDesign = st.face.design ?? null) : openCraft(st.face)"
+                >
+                  <span class="pointer-events-none absolute inset-0" :style="glowStyle(st.face.rarity, 0.22)"></span>
+                  <!-- A stack isn't craftable as such — you pick a colour first
+                       — so it says how many rather than offering the hammer. -->
+                  <span
+                    v-if="st.variants.length > 1"
+                    class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 font-mono text-f8 text-[color:var(--acc)]"
+                  >
+                    <Palette class="h-2.5 w-2.5" /> {{ st.variants.length }}
+                  </span>
+                  <span
+                    v-else
+                    class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 text-f8 uppercase text-[color:var(--acc)] opacity-0 transition-opacity group-hover:opacity-100"
+                  >
+                    <Hammer class="h-2.5 w-2.5" /> Craft
+                  </span>
+                  <div :class="CARD_ART">
+                    <img
+                      :src="st.card.image ?? undefined"
+                      alt=""
+                      loading="lazy"
+                      class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
+                      :class="sheetKey === 'agent' && ART_FADE_B"
+                    />
+                  </div>
+                  <ItemName :item="st.card" strip class="relative z-[2]" />
+                </button>
+              </div>
               <InfiniteSentinel
                 :count="craftWindow.items.value.length"
                 :done="craftWindow.done.value"
                 @hit="craftWindow.grow"
               />
-              <div v-if="!craftList.length" class="col-span-full py-8 text-center text-sm text-muted-foreground">
+              <div v-if="!craftStacks.length" class="col-span-full py-8 text-center text-sm text-muted-foreground">
                 No finishes match your filters.
               </div>
             </template>
@@ -6779,7 +7411,7 @@ if (MDEBUG) {
                  craft editor that isn't client-side, so signed out it would
                  just 401 into a toast. -->
             <button
-              v-if="!isCoarse && signedIn"
+              v-if="!isCoarse && signedIn && canInspect(viewOnly ? craftInst?.item : craft.skin)"
               class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
               :title="viewOnly ? 'Launch CS2 and inspect this item in-game' : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
               @click="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"
@@ -6791,6 +7423,20 @@ if (MDEBUG) {
               :note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE"
               :btn-class="isCompact ? MODAL_HEAD_BTN : undefined"
             />
+            <!-- Also in the footer, deliberately. This row is where the eye goes
+                 for "what can I do with this item", and on a tall spec column the
+                 footer copy can be a scroll away. Icon-only and square, paired
+                 with the trash: same handler and same read-only Craft branch as
+                 the footer button, so it's one control in two places. -->
+            <button
+              v-if="viewOnly && canEdit && craftInst && isCustomizable(craftInst.item)"
+              class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
+              :title="isReadOnly(craftInst) ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
+              @click="craftViewEdit"
+            >
+              <Copy v-if="isReadOnly(craftInst)" :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3.5 w-3.5'" /><Pencil v-else :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3.5 w-3.5'" />
+            </button>
             <!-- Destructive, so it keeps its distance from the action row at the
                  bottom and lives up here beside Close, the way it did on the
                  detail modal this screen replaced. -->
@@ -6892,7 +7538,7 @@ if (MDEBUG) {
                  same baseline as the name and the controls legend, which meant
                  the name — the one thing here anyone reads — was squeezed
                  between two pieces of chrome and truncated first. It now stacks
-                 ABOVE the controls in the right-hand column, so the name plate
+                 ABOVE the controls in a single side column, so the name plate
                  gets the width back and stays optically centred under the
                  model. -->
             <!-- Desktop keeps the three-column baseline so the name plate stays
@@ -6920,18 +7566,22 @@ if (MDEBUG) {
                 v-if="modal3d"
                 :class="isCompact
                   ? 'flex w-full items-center justify-between gap-3'
-                  : 'col-start-3 flex flex-col items-end gap-1 justify-self-end'"
+                  : 'col-start-1 row-start-1 flex flex-col items-start gap-1 justify-self-start'"
               >
                 <a
                   :href="craftReportHref"
                   target="_blank"
                   rel="noopener noreferrer"
-                  :class="REPORT_LINK"
+                  :class="[REPORT_LINK, 'min-w-0 truncate']"
                   title="Open a GitHub issue pre-filled with this item's details"
                 >
                   Report a problem
                 </a>
-                <ViewerControls :edit="!viewOnly" :rotate="craft.stickers.some(Boolean)" />
+                <!-- The legend is fixed-size chrome; the link is the elastic
+                     half of this row. Without the two rules the link's text
+                     wrapped to a second line at phone widths and shoved the
+                     legend down with it. -->
+                <ViewerControls class="flex-none" :edit="!viewOnly" :rotate="craft.stickers.some(Boolean)" />
               </div>
             </div>
           </div>
@@ -6946,11 +7596,29 @@ if (MDEBUG) {
                wraps under the preview and owns the whole modal, so the cap just
                left a dead gutter down the right-hand side. -->
           <div
+            v-if="craftHasOptions"
             class="flex w-full flex-none flex-col gap-2.5"
             :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px]']"
           >
             <template v-if="!viewOnly">
-            <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
+            <!-- FIRST, above the attachment slots. The name is the one field
+                 that is pure text entry and it applies to the item itself
+                 rather than to a slot on it — buried under five sticker wells
+                 it read as an afterthought. -->
+            <label
+              v-if="!['agent', 'musickit', 'graffiti'].includes(selected)"
+              class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5"
+              :style="{ '--i': 0 }"
+            >
+              <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
+              <input
+                v-model="craft.nametag"
+                maxlength="24"
+                placeholder="Type a custom name…"
+                class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+              />
+            </label>
+            <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
               <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
                 <button
@@ -6972,7 +7640,7 @@ if (MDEBUG) {
                 </button>
               </div>
             </div>
-            <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
+            <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 flex items-baseline gap-2">
                 <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Stickers</span>
                 <button
@@ -7049,7 +7717,7 @@ if (MDEBUG) {
                 </label>
               </div>
             </div>
-            <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
+            <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
               <div class="mb-1.5 flex items-baseline gap-2">
                 <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Charm</span>
                 <button
@@ -7106,15 +7774,6 @@ if (MDEBUG) {
                 </label>
               </div>
             </div>
-            <label class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
-              <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
-              <input
-                v-model="craft.nametag"
-                maxlength="24"
-                placeholder="Type a custom name…"
-                class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-              />
-            </label>
             <div v-if="!['agent', 'musickit', 'graffiti'].includes(selected)" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
               <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
               <!-- flex-1, not a fixed width: Pattern sat at w-24 and Wear at
@@ -7170,7 +7829,14 @@ if (MDEBUG) {
                  should feel like the numbers became typable, not like the page
                  changed. -->
             <template v-else>
-              <div v-if="craftInst && attachmentsOf(craftInst).length" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
+              <!-- Name tag leads here too — the read-only spec has to list the
+                   same things in the same order as the form, or switching modes
+                   reshuffles the panel under the cursor. -->
+              <div v-if="craft.nametag" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
+                <span class="min-w-0 flex-1 truncate text-f13 italic">“{{ craft.nametag }}”</span>
+              </div>
+              <div v-if="craftInst && attachmentsOf(craftInst).length" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
                 <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Applied</div>
                 <div class="flex flex-col gap-1.5">
                   <span
@@ -7184,10 +7850,6 @@ if (MDEBUG) {
                   </span>
                 </div>
               </div>
-              <div v-if="craft.nametag" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
-                <span class="min-w-0 flex-1 truncate text-f13 italic">“{{ craft.nametag }}”</span>
-              </div>
               <div v-if="craftInst?.seed != null" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
                 <span class="font-mono text-f13">#{{ craftInst.seed }}</span>
@@ -7197,7 +7859,7 @@ if (MDEBUG) {
                   <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
                   <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ wearTier(craftInst.wear) }}</span>
                 </div>
-                <div class="mt-2"><WearBar :wear="craftInst.wear" /></div>
+                <div class="mt-2"><WearBar :item="craftInst.item" :wear="craftInst.wear" /></div>
               </div>
               <div v-if="craftInst?.stattrak" class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
                 <span class="text-f10 uppercase tracking-cs1 text-[#f2c14e]">StatTrak™</span>
@@ -7377,13 +8039,24 @@ if (MDEBUG) {
         <!-- Same row, same positions in both modes: dismiss on the left, the
              commit on the right. Editing commits a change to the item; viewing
              commits it to your loadout — so Equip inherits Save's slot. -->
+        <!-- Every button in this row is the same BOX: h-9, rounded-md, px-4, f11,
+             1px border (transparent on the filled ones). What separates the
+             primary action is the amber fill, not extra size. Getting there took
+             three passes, so the traps, in the order they bit:
+               · height came from padding + line-height, and f13 text is taller
+                 than f11 — pinning h-9 is what actually equalises them;
+               · `0 2px 0` under the CTA paints a hard bar BELOW the box, which
+                 reads as two more pixels of button. It's a soft blur now;
+               · rounded-sm vs rounded-md makes two same-size boxes look like
+                 different sizes at the corners.
+             Change one of these and change all of them. -->
         <div class="flex items-center justify-end border-t border-border" :class="isCompact ? 'gap-2 px-3 py-2.5' : 'gap-3 px-5 py-3.5'">
-          <button class="rounded px-4 py-2 text-f13 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground" @click="closeCraft()">{{ viewOnly ? 'Close' : 'Cancel' }}</button>
+          <button class="flex h-9 items-center rounded-md border border-transparent px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground" @click="closeCraft()">{{ viewOnly ? 'Close' : 'Cancel' }}</button>
           <!-- Edit is secondary here: it changes the item, but equipping it is
                what you came to decide. -->
           <button
-            v-if="viewOnly && canEdit && craftInst"
-            class="flex items-center gap-1.5 rounded-md border border-border px-4 py-2 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            v-if="viewOnly && canEdit && craftInst && isCustomizable(craftInst.item)"
+            class="flex h-9 items-center gap-1.5 rounded-md border border-border px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
             :title="isReadOnly(craftInst) ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
             @click="craftViewEdit"
           >
@@ -7392,8 +8065,8 @@ if (MDEBUG) {
           </button>
           <button
             v-if="viewOnly && canEdit"
-            class="flex items-center gap-1.5 rounded-sm px-5 py-2 text-f13 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-            style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 2px 0 rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.22)"
+            class="flex h-9 items-center gap-1.5 rounded-md border border-transparent px-4 text-f11 font-bold uppercase tracking-wider text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 1px 3px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.22)"
             :disabled="!craftEquipTarget"
             :title="craftEquipTarget ? 'Equip on ' + team : 'Not usable by ' + team"
             @click="craftViewEquip"
@@ -7409,7 +8082,7 @@ if (MDEBUG) {
                a fresh craft is already new, and Save would overwrite. -->
           <button
             v-if="!viewOnly && editingId != null"
-            class="flex items-center gap-1.5 rounded-md border border-border px-4 py-2 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            class="flex h-9 items-center gap-1.5 rounded-md border border-border px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
             :disabled="craftBusy || !signedIn"
             title="Save these changes as a new item, leaving the original untouched"
             @click="duplicateCraft"
@@ -7418,8 +8091,8 @@ if (MDEBUG) {
           </button>
           <button
             v-if="!viewOnly"
-            class="flex items-center gap-1.5 rounded-sm px-5 py-2 text-f13 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
-            style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 2px 0 rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.22)"
+            class="flex h-9 items-center gap-1.5 rounded-md border border-transparent px-4 text-f11 font-bold uppercase tracking-wider text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+            style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 1px 3px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.22)"
             :disabled="craftBusy || !signedIn"
             :title="signedIn ? undefined : 'Sign in to save this to your inventory'"
             @click="confirmCraft"
@@ -7525,7 +8198,7 @@ if (MDEBUG) {
           <Replace class="h-3.5 w-3.5" /> Replace weapon…
         </button>
         <button
-          v-if="ctx && equippedInstance(ctx.pos) && !isCoarse"
+          v-if="ctx && equippedInstance(ctx.pos) && !isCoarse && canInspect(equippedInstance(ctx.pos)?.item)"
           class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
           @click="ctxInspect"
         >
@@ -7725,10 +8398,14 @@ if (MDEBUG) {
         >
           <Sparkles class="h-3.5 w-3.5" /> {{ itemCtx.inst.stattrak ? 'Remove' : 'Add' }} StatTrak™
         </button>
-        <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxEdit">
+        <button
+          v-if="isCustomizable(itemCtx?.inst.item)"
+          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          @click="itemCtxEdit"
+        >
           <Pencil class="h-3.5 w-3.5" /> Edit…
         </button>
-        <button v-if="!isCoarse" class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxInspect">
+        <button v-if="!isCoarse && canInspect(itemCtx?.inst.item)" class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxInspect">
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button

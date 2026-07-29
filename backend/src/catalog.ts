@@ -51,6 +51,23 @@ export interface CatalogSkin {
   model?: string | null;
   paintMaterial?: string | null;
   legacyPaint?: boolean;
+  /** Game defindex. Absent means the item CANNOT be expressed as an inspect
+   *  link (1,767 of the 2,205 graffiti have none), which is the one thing the
+   *  frontend can't work out for itself — so every listing says. */
+  def?: number;
+  // ---- sheet facets. Optional, and only graffiti carries them today; the
+  // sheet's filter bar is driven ENTIRELY by which of these show up on the
+  // list it loaded, so a catalog that omits them renders exactly as before.
+  /** Coarse "what IS this" split — the tab strip. See GRAFFITI_GROUPS. */
+  group?: string;
+  /** Capsule / box / tournament this came in. Omitted when it came in none. */
+  collection?: string;
+  /** Artwork identity shared by every colour variant — the STACK key. */
+  design?: number;
+  /** Colourway id, for the items that come in more than one. */
+  tint?: number;
+  /** That colourway's name ("Cash Green"). */
+  tintName?: string;
 }
 
 // The 36 base (vanilla) weapons. Excludes the C4. `id` is the base economy
@@ -101,10 +118,11 @@ export function getWeaponSkins(model: string): {
       model: (i.model as string) ?? null,
       paintMaterial: i.paintMaterial ?? null,
       legacyPaint: !!i.legacy,
+      def: i.def,
     }));
   return {
     base: base
-      ? { id: base.id, name: base.name, rarity: base.rarity as string, image: img(base.image) }
+      ? { id: base.id, name: base.name, rarity: base.rarity as string, image: img(base.image), def: base.def }
       : null,
     skins,
   };
@@ -123,6 +141,7 @@ export function getAgents() {
       rarity: a.rarity as string,
       teams: teamsOf(a),
       image: img(a.image),
+      def: a.def,
     }));
 }
 
@@ -141,6 +160,7 @@ export function getKnives(): CatalogSkin[] {
       model: (k.model as string) ?? null,
       paintMaterial: k.paintMaterial ?? null,
       legacyPaint: !!k.legacy,
+      def: k.def,
     }));
 }
 
@@ -152,6 +172,7 @@ export function getMusicKits(): CatalogSkin[] {
       name: m.name,
       rarity: m.rarity as string,
       image: img(m.image),
+      def: m.def,
     }));
 }
 
@@ -423,15 +444,112 @@ export function searchAttachments(query: AttachQuery): AttachPage {
   };
 }
 
+// ---- Graffiti ---------------------------------------------------------------
+//
 // The graffiti SHEET is a different shape from the pickers: it filters, sorts
 // and facets client-side over the whole list (like every other weapon sheet), so
 // paging it server-side would quietly reduce its search box to "search the pages
 // you happen to have loaded". ~2.2k items is small enough to hand over whole and
 // let the grid's render window keep the DOM sane.
-export function getGraffiti(): CatalogSkin[] {
-  return items
-    .filter((i) => i.type === "graffiti")
-    .map((i) => ({ id: i.id, name: i.name, rarity: i.rarity as string, image: img(i.image) }));
+//
+// What the sheet CAN'T do for itself is name the facets: cs2-lib gives graffiti
+// no `category` (the field stickers get their capsule from — zero of the 2,205
+// carry one), so every split below is derived here and shipped alongside.
+
+/** Tab order as shown, left to right. "All" is the frontend's own, and goes last. */
+const GRAFFITI_GROUPS: { value: string; label: string }[] = [
+  { value: "art", label: "Art" },
+  // 384 tournament team crests. Undivided they're ~1 tile in 6 of the sheet,
+  // and none of them is what you came to the Art tab looking for.
+  { value: "team", label: "Team Logos" },
+];
+
+/**
+ * Swatch colours for the 19 colourways, indexed by the game's tint id.
+ *
+ * DECORATIVE ONLY — these are eyeballed approximations for the dot beside the
+ * label in the filter dropdown, not the tint the game actually applies (that
+ * lives in the sprayed material, not in any item field). The label is what
+ * carries the meaning; the dot only has to be close enough to scan by.
+ */
+const GRAFFITI_TINT_HEX: Record<number, string> = {
+  1: "#9c3b2e", 2: "#7a1f1f", 3: "#d2691e", 4: "#8b6b4a", 5: "#d99a2b",
+  6: "#e8d84a", 7: "#4a5d33", 8: "#2e6b3f", 9: "#5fbf4a", 10: "#2fa36b",
+  11: "#3aa8c1", 12: "#2f5fb3", 13: "#1f3a6e", 14: "#6a3fa0", 15: "#a24bd4",
+  16: "#e0559b", 17: "#f2a8c6", 18: "#b3567a", 19: "#e6e6e6",
+};
+
+export interface GraffitiCatalog {
+  skins: CatalogSkin[];
+  /** Tab strip, in display order. Empty tabs are dropped by the caller. */
+  groups: { value: string; label: string }[];
+  /** Colourways in game order, so the dropdown reads red → white, not A→Z. */
+  tints: { value: string; label: string; color: string }[];
+}
+
+let graffitiCatalog: GraffitiCatalog | null = null;
+
+export function getGraffiti(): GraffitiCatalog {
+  if (graffitiCatalog) return graffitiCatalog;
+  const graffiti = items.filter((i) => i.type === "graffiti");
+
+  // Which box a spray came in. There is no field for this — the only record is
+  // the six graffiti containers' own `contents`, read backwards. Covers 1,042
+  // of the 2,205; the tournament sprays are covered by their event instead and
+  // the rest genuinely belong to no collection (they get "", same as a
+  // capsule-less sticker — see searchAttachments).
+  //
+  // `rawContents`, not `contents`: the latter asserts the item IS a container
+  // (expectContainer in cs2-lib, which throws) and inflates every id into a full
+  // item object. All we want is the ids.
+  const ids = new Set(graffiti.map((i) => i.id));
+  const boxes = new Map<number, string>();
+  for (const c of items) {
+    if (c.type !== "case") continue;
+    const contents = c.rawContents;
+    if (!Array.isArray(contents)) continue;
+    for (const id of contents) {
+      if (ids.has(id) && !boxes.has(id)) boxes.set(id, c.name.replace(/^Container \| /, ""));
+    }
+  }
+
+  // Colourway names come from the data rather than a table of our own: the
+  // parenthesised suffix is the tint's name for all 1,767 tinted sprays, with
+  // no untinted spray carrying one. A table would be a second place to keep
+  // them right.
+  const tintNames = new Map<number, string>();
+  const skins = graffiti.map((i) => {
+    const tint = i.tint as number | undefined;
+    const tintName = tint != null ? /\(([^()]+)\)\s*$/.exec(i.name)?.[1] : undefined;
+    if (tint != null && tintName) tintNames.set(tint, tintName);
+    return {
+      id: i.id,
+      name: i.name,
+      rarity: i.rarity as string,
+      image: img(i.image),
+      def: i.def,
+      // Same rule the sticker index uses: a tournamentDesc means it came out of
+      // an event capsule, and for graffiti that only ever means a team crest.
+      group: i.tournamentDesc ? "team" : "art",
+      // "Graffiti | Astralis | Atlanta 2017" — the third segment IS the event,
+      // and reads far better as a filter value than the tournamentDesc
+      // sentence it's taken from ("This item commemorates the 2017 ELEAGUE…").
+      collection: (i.tournamentDesc ? i.name.split(" | ")[2] : boxes.get(i.id)) || undefined,
+      // 531 designs across 2,205 items: 93 of them exist in all 19 colourways
+      // and 438 in exactly one. This is what the sheet stacks on.
+      design: i.index as number | undefined,
+      tintName,
+    } satisfies CatalogSkin;
+  });
+
+  graffitiCatalog = {
+    skins,
+    groups: GRAFFITI_GROUPS,
+    tints: [...tintNames.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([id, label]) => ({ value: label, label, color: GRAFFITI_TINT_HEX[id] ?? "#888888" })),
+  };
+  return graffitiCatalog;
 }
 
 // Resolve items by id. Shareable craft links carry only ids (a URL can't hold
@@ -475,6 +593,7 @@ export function getGloves(): CatalogSkin[] {
       name: g.name,
       rarity: g.rarity as string,
       image: img(g.image),
+      def: g.def,
     }));
 }
 
@@ -632,6 +751,12 @@ export function getItem(id: number) {
       def: i.def,
       index: i.index,
       tint: i.tint,
+      // Same two the graffiti catalog derives, under the same names, so the
+      // OWNED list can stack colourways exactly the way the craft grid does.
+      // `index` and `tint` are already right here, but they're the game's
+      // vocabulary and the sheet speaks design/tintName.
+      design: i.type === "graffiti" ? (i.index as number | undefined) : undefined,
+      tintName: i.type === "graffiti" ? /\(([^()]+)\)\s*$/.exec(i.name)?.[1] : undefined,
       paintMaterial: i.paintMaterial ?? null,
       legacyPaint: !!i.legacy,
     };

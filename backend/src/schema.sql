@@ -69,3 +69,12 @@ CREATE TABLE IF NOT EXISTS inventory.settings (
   value text NOT NULL,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- "This account has run a Steam sync at least once." Deliberately its own row
+-- rather than inferred from owned_items: a sync that imports NOTHING (private
+-- inventory, or nothing CS2 in it) still counts as done, and the UI nags with
+-- an orange dot until it is. A row here says the user has been through it.
+CREATE TABLE IF NOT EXISTS inventory.steam_sync (
+  steam_id bigint PRIMARY KEY,
+  synced_at timestamptz NOT NULL DEFAULT now()
+);

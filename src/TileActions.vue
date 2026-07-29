@@ -13,7 +13,7 @@
 import { computed } from "vue";
 import { Box, Copy, ExternalLink, Pencil, Trash2 } from "lucide-vue-next";
 import type { InventoryItem } from "./api";
-import { isReadOnly, supports3d } from "./itemVisuals";
+import { canInspect, isCustomizable, isReadOnly, supports3d } from "./itemVisuals";
 import { isCoarse } from "./responsive";
 
 const props = withDefaults(
@@ -32,6 +32,12 @@ const emit = defineEmits<{ (e: "view3d" | "inspect" | "edit" | "duplicate" | "re
 const readOnly = computed(() => isReadOnly(props.inst));
 // Hidden, not disabled, for types we have no models for — see supports3d.
 const can3d = computed(() => supports3d(props.inst.item));
+// Same treatment for Edit: a graffiti has no float, pattern, StatTrak, name tag
+// or attachment slots, so the pencil opened an empty form. See isCustomizable.
+const canEditItem = computed(() => isCustomizable(props.inst.item));
+// Not every economy item has a defindex to build a steam:// link around — see
+// canInspect. Hidden rather than left to fail with a toast on click.
+const canInspectItem = computed(() => canInspect(props.inst.item));
 
 const BTN = computed(
   () =>
@@ -50,14 +56,14 @@ const ICON = computed(() => (props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
   >
     <span v-if="can3d" :class="BTN" title="View in 3D" @click.stop="emit('view3d')"><Box :class="ICON" /></span>
     <!-- steam:// can't launch CS2 from a phone — hide the dead-end on touch. -->
-    <span :class="BTN" title="Inspect in game" @click.stop="emit('inspect')"><ExternalLink :class="ICON" /></span>
+    <span v-if="canInspectItem" :class="BTN" title="Inspect in game" @click.stop="emit('inspect')"><ExternalLink :class="ICON" /></span>
     <span
       v-if="readOnly"
       :class="BTN"
       title="Synced from Steam and read-only — craft your own copy of it"
       @click.stop="emit('duplicate')"
     ><Copy :class="ICON" /></span>
-    <span v-else :class="BTN" title="Edit item" @click.stop="emit('edit')"><Pencil :class="ICON" /></span>
+    <span v-else-if="canEditItem" :class="BTN" title="Edit item" @click.stop="emit('edit')"><Pencil :class="ICON" /></span>
     <span
       :class="[BTN, 'hover:!text-[#ff7a6a]']"
       title="Delete from inventory"

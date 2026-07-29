@@ -91,7 +91,7 @@ const controls = computed<Control[]>(() => {
 
 <template>
   <div
-    class="inline-flex items-center gap-0.5 rounded-lg border border-border/60 p-1 backdrop-blur"
+    class="inline-flex flex-none flex-nowrap items-center gap-0.5 rounded-lg border border-border/60 p-1 backdrop-blur"
     :class="variant === 'overlay' && 'opacity-70 transition-opacity duration-200 hover:opacity-100'"
     style="background: hsl(var(--background) / 0.72); box-shadow: 0 6px 20px -10px hsl(var(--background))"
   >
@@ -99,10 +99,13 @@ const controls = computed<Control[]>(() => {
       <span v-if="c.group" class="mx-1 h-5 w-px flex-none bg-border/70"></span>
 
       <!-- Coarse pointers get the label printed; there is no hover to reveal a
-           tooltip on, and an unexplained glyph is worse than no glyph. -->
+           tooltip on, and an unexplained glyph is worse than no glyph.
+           `flex-none` + `whitespace-nowrap`: the printed label is what makes a
+           cell wider than its glyph, and a squeezed row broke the labels across
+           two lines rather than letting the bar keep its width. -->
       <span
         v-if="isCoarse"
-        class="flex flex-col items-center gap-0.5 rounded px-1.5 py-0.5 text-muted-foreground"
+        class="flex flex-none flex-col items-center gap-0.5 whitespace-nowrap rounded px-1 py-0.5 text-muted-foreground"
       >
         <svg
           :viewBox="CONTROL_ICON_VIEWBOX"
@@ -120,7 +123,7 @@ const controls = computed<Control[]>(() => {
 
       <Tooltip v-else :text="c.hint" side="top" :delay="180">
         <span
-          class="flex cursor-default items-center gap-1 rounded px-1.5 py-1 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+          class="flex flex-none cursor-default items-center gap-1 whitespace-nowrap rounded px-1.5 py-1 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
           :aria-label="c.hint"
         >
           <span

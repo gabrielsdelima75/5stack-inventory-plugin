@@ -9,12 +9,20 @@
 // context, and the float's own position gets the light — a lit zone in its tier
 // colour plus a white needle. The eye lands on the value, not the rainbow.
 import { computed } from "vue";
-import { WEAR_BOUNDS, WEAR_GRADIENT, wearColor, wearTier } from "./itemVisuals";
+import { hasSeed, hasWear, WEAR_BOUNDS, WEAR_GRADIENT, wearColor, wearTier } from "./itemVisuals";
 
 const props = withDefaults(
   defineProps<{
     wear?: number | null;
     seed?: number | null;
+    /**
+     * The item the readings belong to, so this can drop the ones its type
+     * doesn't HAVE. Instances store wear 0 / seed 1 whatever they are, so a
+     * spray was rendering a factory-new ramp at "0.0000 · #1" — a reading that
+     * looks real and means nothing. Omitting the prop keeps everything (the
+     * old behaviour); passing it opts into the gate.
+     */
+    item?: { type?: string | null } | null;
     /** Tighter track + type, for grid cells rather than inventory tiles. */
     compact?: boolean;
     /**
@@ -41,20 +49,24 @@ const props = withDefaults(
   { wear: null, seed: null, compact: false, inline: false, mini: false, bare: false },
 );
 
-const pct = computed(() => Math.min(100, Math.max(0, (props.wear ?? 0) * 100)));
-const color = computed(() => wearColor(props.wear ?? 0));
+// Every read below goes through these, not through props.wear/props.seed, so
+// the type gate can't be applied to the track and missed on the numbers.
+const shownWear = computed(() => (props.item === undefined || hasWear(props.item) ? props.wear : null));
+const shownSeed = computed(() => (props.item === undefined || hasSeed(props.item) ? props.seed : null));
+const pct = computed(() => Math.min(100, Math.max(0, (shownWear.value ?? 0) * 100)));
+const color = computed(() => wearColor(shownWear.value ?? 0));
 // Mini drops both numbers, so the tooltip has to carry the whole readout.
 const tip = computed(() => {
   const parts: string[] = [];
-  if (props.wear != null) parts.push(`${wearTier(props.wear)} · ${props.wear.toFixed(4)}`);
-  if (props.seed != null) parts.push(`#${props.seed}`);
+  if (shownWear.value != null) parts.push(`${wearTier(shownWear.value)} · ${shownWear.value.toFixed(4)}`);
+  if (shownSeed.value != null) parts.push(`#${shownSeed.value}`);
   return parts.join(" · ") || undefined;
 });
 </script>
 
 <template>
   <div
-    v-if="wear != null || seed != null"
+    v-if="shownWear != null || shownSeed != null"
     :class="
       inline
         ? 'flex items-center gap-2'
@@ -71,20 +83,20 @@ const tip = computed(() => {
       v-if="mini"
       class="flex items-baseline gap-1.5 font-mono text-f8 leading-none tabular-nums"
     >
-      <span v-if="wear != null" class="text-foreground/85">{{ wear.toFixed(4) }}</span>
-      <span v-if="seed != null" class="text-muted-foreground">#{{ seed }}</span>
+      <span v-if="shownWear != null" class="text-foreground/85">{{ shownWear.toFixed(4) }}</span>
+      <span v-if="shownSeed != null" class="text-muted-foreground">#{{ shownSeed }}</span>
     </span>
     <span
-      v-if="inline && wear != null"
+      v-if="inline && shownWear != null"
       class="flex-none font-mono tabular-nums text-foreground/85"
       :class="compact ? 'text-f8' : 'text-f9'"
-      >{{ wear.toFixed(4) }}</span
+      >{{ shownWear.toFixed(4) }}</span
     >
 
     <!-- Track. Outer stays overflow-visible so the needle can overhang; the
          painted layers clip to the pill inside it. -->
     <div
-      v-if="wear != null"
+      v-if="shownWear != null"
       class="relative"
       :class="[
         mini ? 'h-[3px]' : compact ? 'h-[5px]' : 'h-[6px]',
@@ -129,19 +141,19 @@ const tip = computed(() => {
     </div>
 
     <span
-      v-if="inline && seed != null"
+      v-if="inline && shownSeed != null"
       class="flex-none font-mono tabular-nums text-muted-foreground"
       :class="compact ? 'text-f8' : 'text-f9'"
-      >#{{ seed }}</span
+      >#{{ shownSeed }}</span
     >
 
     <div
       v-if="!inline && !mini && !bare"
       class="flex items-center justify-between font-mono tabular-nums"
-      :class="[compact ? 'text-f8' : 'text-f9', wear != null && 'mt-1.5']"
+      :class="[compact ? 'text-f8' : 'text-f9', shownWear != null && 'mt-1.5']"
     >
-      <span v-if="wear != null" class="text-foreground/85">{{ wear.toFixed(4) }}</span>
-      <span v-if="seed != null" class="text-muted-foreground">#{{ seed }}</span>
+      <span v-if="shownWear != null" class="text-foreground/85">{{ shownWear.toFixed(4) }}</span>
+      <span v-if="shownSeed != null" class="text-muted-foreground">#{{ shownSeed }}</span>
     </div>
   </div>
 </template>

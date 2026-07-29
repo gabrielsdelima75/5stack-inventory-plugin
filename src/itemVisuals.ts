@@ -129,3 +129,38 @@ export const isReadOnly = (i: InventoryItem) => i.origin === "steam";
 // still be missing from the mount, which the viewer's own HEAD probe catches.
 const TYPES_3D = new Set(["weapon", "melee"]);
 export const supports3d = (item?: { type?: string | null } | null) => !!item?.type && TYPES_3D.has(item.type);
+
+// Which types actually HAVE a float and a pattern, mirroring cs2-lib's own
+// CS2_PAINTABLE_ITEMS / CS2_SEEDABLE_ITEMS. Everything else — graffiti, music
+// kits, agents, stickers, patches, pins — is stored with wear 0 / seed 1
+// because the columns aren't nullable, and rendering those reads as a real
+// reading: a spray was showing a factory-new ramp at "0.0000 · #1".
+const TYPES_WEAR = new Set(["weapon", "melee", "glove"]);
+const TYPES_SEED = new Set(["weapon", "melee", "glove", "keychain"]);
+export const hasWear = (item?: { type?: string | null } | null) => !!item?.type && TYPES_WEAR.has(item.type);
+export const hasSeed = (item?: { type?: string | null } | null) => !!item?.type && TYPES_SEED.has(item.type);
+
+/**
+ * Is there anything on this item you could change?
+ *
+ * The union of every editable attribute's types: float and pattern (weapon,
+ * melee, glove, and the charm's own pattern), StatTrak (+ music kits), name tag,
+ * and attachment slots (weapon: stickers + charm; agent: patches). A graffiti
+ * has none of them — its Edit button opened a form with nothing in it, so the
+ * only verb it has is equip. Same for stickers, patches and pins.
+ */
+const TYPES_EDITABLE = new Set(["weapon", "melee", "glove", "musickit", "agent", "keychain"]);
+export const isCustomizable = (item?: { type?: string | null } | null) =>
+  !!item?.type && TYPES_EDITABLE.has(item.type);
+
+/**
+ * Can this item be expressed as a steam:// inspect link?
+ *
+ * An inspect link is built around the game DEFINDEX, and not every economy item
+ * has one — 1,767 of the 2,205 graffiti don't, which is why "Inspect in game"
+ * on a tinted spray came back with "That item can't be expressed as an inspect
+ * link". Not a type-level rule: the 438 graffiti that DO have a defindex
+ * inspect fine, so this asks the item rather than its type. Every catalog
+ * listing carries `def` for exactly this.
+ */
+export const canInspect = (item?: { def?: number | null } | null) => item?.def != null;

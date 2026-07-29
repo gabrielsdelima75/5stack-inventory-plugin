@@ -24,6 +24,9 @@ import CHARM_ANCHORS from "./charmAnchors.json";
 // Per-weapon StatTrak module anchors, same provenance as the charm anchors but
 // keeping the attachment's rotation too (see stattrakModule.ts).
 import STATTRAK_ANCHORS from "./stattrakAnchors.json";
+import NAMETAG_ANCHORS from "./nametagAnchors.json";
+// Same shared-prop tree the StatTrak module comes from — see MODULE_GLB.
+const NAMETAG_GLB = "extra/nametag_module";
 import {
   composeDigitAtlas,
   isDisplayMaterial,
@@ -1420,6 +1423,8 @@ export interface ViewerHandle {
   setCharm: (charm: CharmPlacement | null) => void;
   /** Attach/detach the StatTrak module without remounting (keeps the camera). */
   setStatTrak: (spec: { count: number | null } | null) => void;
+  /** Swap the engraved name plate. Empty or null removes it. */
+  setNameTag: (text: string | null) => void;
   /**
    * Turn placement gestures on/off on a LIVE viewer — see ViewerOpts.interactive
    * for what they are. The craft modal shows one item in two modes (view and
@@ -1483,6 +1488,8 @@ export interface ViewerOpts {
    * real count.
    */
   stattrak?: { count: number | null } | null;
+  /** Custom name. Puts the engraved plate on the weapon's `nametag` anchor. */
+  nametag?: string | null;
   stickerBounds?: StickerBounds | null;
   /** Per-slot UV anchors from the model. Without them placement falls back to
    *  the old silhouette guess, which does NOT match the game. */
@@ -5076,6 +5083,135 @@ vec3 csCharmAdjust( vec3 linear ) {
   // module in the fit would make a StatTrak card frame its weapon very slightly
   // smaller than the non-StatTrak card of the same gun, and the two sit side by
   // side in the grid.
+  /**
+   * Seat a bolted-on module at one of the weapon's own attachment points.
+   *
+   * Shared by the StatTrak module and the name plate because the hard parts are
+   * identical and were expensive to get right: the anchor is in BIND MODEL
+   * space and has to ride the same pose the body's vertices were baked
+   * through, the clip's rotation has to be applied without re-applying the
+   * glTF axis swizzle, and an attachment point is not a surface so the module
+   * has to be pushed onto the geometry.
+   *
+   * Returns false when the anchor is unusable, which callers treat as "render
+   * the weapon without this module".
+   */
+  function placeAttachedModule(
+    mod: import("three").Object3D,
+    anchor: import("./stattrakModule").StatTrakAnchor,
+    bone?: string,
+    /**
+     * Cast the seating ray from where the module ACTUALLY ended up rather than
+     * from `anchor.pos`.
+     *
+     * `pos` is the pre-swizzled fallback for a skeleton-less model, and on a
+     * real weapon it does not agree with the posed position — measured on the
+     * AK, StatTrak's stored pos is [0.013, 0.034, 0.213] against a posed
+     * [0.013, 0.051, 0.028]. Only x lines up. StatTrak survives that because
+     * the ray simply misses from there and seating no-ops, but the name plate's
+     * ray either misses (leaving it floating proud of the receiver) or hits
+     * unrelated geometry and drags the plate off the gun.
+     *
+     * Opt-in so StatTrak's placement stays byte-identical — it is known good
+     * and this is not the change to perturb it with.
+     */
+    seatFromPosed = false,
+  ): boolean {
+    const xform = stattrakTransform(anchor);
+    if (!xform) return false;
+    const { src, pos, euler } = xform;
+    // Which bone actually carries this attachment. Unnamed means "the body",
+    // i.e. exactly what poseXform already is — every gun takes that branch and
+    // nothing about them changes. See StatTrakAnchorSet.bone.
+    const bonePose = (bone ? poseBones.byName.get(bone) : null) ?? poseXform;
+    // POSITION and ROTATION both ride the bone's pose, but they take DIFFERENT
+    // parts of it — treating them as symmetric is a regression waiting to
+    // happen, and it broke every gun once already.
+    //
+    // Position: `src` is the attachment origin PLUS its parent bone's
+    // model-space position (on a gun the attachment hangs off `weapon_offset`,
+    // a child of `weapon`, and `weapon` carries the real offset — 18.23, -0.19,
+    // 12.40 on the M4). That lands in bind space, and the body's vertices were
+    // baked through the inventory_icon clip, which translates the weapon to the
+    // origin (measured: raw geometry spans 1.39..36.77 inches yet the baked box
+    // comes out centred with center ~= 0). The pose makes the same trip:
+    // bind MODEL INCHES -> baked WORLD metres. No `center` correction —
+    // object.position applies -center to geometry and module alike.
+    if (bonePose) {
+      mod.position.set(src[0], src[1], src[2]).applyMatrix4(bonePose);
+    } else {
+      mod.position.set(pos[0], pos[1], pos[2]);
+    }
+    // Rotation must NOT be the pose's rotation WHOLE. That matrix carries the
+    // glb node matrix (the model->world axis swizzle), and the module's OWN glb
+    // node already applies the identical swizzle — taking the rotation from it
+    // applies the swap twice and stands the module on end. On the M4, whose
+    // anchor angles are exactly [0,0,0], that turned a correct horizontal
+    // readout into a vertical black bar.
+    //
+    // Divide the swizzle out and what is left is the rotation the CLIP applied,
+    // which the module does have to share: it is bolted to the gun, so if the
+    // pose turns the gun the module turns with it. On guns that residual
+    // measures 0.05-0.09 degrees — the pose is a pure translation and this stays
+    // the no-op it has always been. On the elite's `weapon_r` it is 65 degrees,
+    // and without it the module hangs beside the pistol at a visibly wrong
+    // angle.
+    //
+    // Onto that goes the attachment's own tilt, swizzled to match the position
+    // (glb x,y,z = model y,z,x). Every GUN anchor is unrotated, so that half is
+    // unconstrained by guns — which is exactly why knives (karambit
+    // [-54.1, 0, -170.4]) do not work yet and stay gated above.
+    const clipQuat = clipRotation(THREE, bonePose, poseBones.modelQuat) ?? new THREE.Quaternion();
+    mod.quaternion
+      .copy(clipQuat)
+      .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(euler[1], euler[2], euler[0], "ZYX")));
+
+    // ---- Seat it against the body -------------------------------------------
+    // The anchor is validated (muzzle_flash lands 2cm past the barrel on a 90cm
+    // gun, shell_eject on the correct side), but an attachment point is not a
+    // surface: CS2 mounts the module flush and ours reads as floating a
+    // centimetre proud. The charm gets away with the same anchor space because
+    // it DANGLES — a bolted-on module cannot.
+    //
+    // So cast inward along the side axis and slide the module's inner face onto
+    // whatever it hits. Render-only, exactly like liftOutOfBody: no stored
+    // value is touched, so this cannot desync from what the game is sent.
+    {
+      const ref = seatFromPosed
+        ? [mod.position.x, mod.position.y, mod.position.z]
+        : pos;
+      const outward = ref[0] >= 0 ? 1 : -1;
+      // Extent about the module's OWN origin, with its tilt already applied.
+      const self = new THREE.Box3().setFromObject(mod).translate(mod.position.clone().negate());
+      const innerFace = outward > 0 ? self.min.x : self.max.x;
+      const probe = 0.06;
+      const dirWorld = new THREE.Vector3(-outward, 0, 0).transformDirection(object.matrixWorld).normalize();
+      const start = object.localToWorld(new THREE.Vector3(ref[0] + outward * probe, ref[1], ref[2]));
+      raycaster.set(start, dirWorld);
+      raycaster.far = probe * 2;
+      const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+      if (!hit) mod.userData.seating = { ref: [...ref], outward, missed: true };
+      if (hit) {
+        const surfaceX = object.worldToLocal(hit.point.clone()).x;
+        // The knife module is a FLAT plate (measured: y extent exactly 0), so
+        // its inner face IS its outer face. Seating that dead on the surface
+        // z-fights; lift it by a fraction of a millimetre.
+        const bias = Math.abs(self.max.x - self.min.x) < 1e-5 ? outward * 0.0002 : 0;
+        const seated = surfaceX - innerFace + bias;
+        // Cap the correction. A ray that slips through a gap (the magwell
+        // opening sits right below this anchor on an M4) would otherwise drag
+        // the module deep into the receiver — far worse than leaving it proud.
+        const applied = Math.abs(seated - ref[0]) <= 0.02;
+        if (applied) mod.position.x = seated;
+        // What the seating actually saw. Reading this off the mounted module is
+        // the only way to tell a ray that missed from a correction that was
+        // capped — the two look identical from outside.
+        mod.userData.seating = { ref: [...ref], outward, innerFace, surfaceX, seated, applied };
+      }
+    }
+    return true;
+  }
+
   const stattrakDisposables: { dispose: () => void }[] = [];
   let stattrakMod: import("three").Object3D | null = null;
   async function mountStatTrak(spec: { count: number | null }) {
@@ -5169,89 +5305,7 @@ vec3 csCharmAdjust( vec3 linear ) {
       }
       display.needsUpdate = true;
     });
-    const xform = stattrakTransform(anchor);
-    if (!xform) return;
-    const { src, pos, euler } = xform;
-    // Which bone actually carries this attachment. Unnamed means "the body",
-    // i.e. exactly what poseXform already is — every gun takes that branch and
-    // nothing about them changes. See StatTrakAnchorSet.bone.
-    const bonePose = (bone ? poseBones.byName.get(bone) : null) ?? poseXform;
-    // POSITION and ROTATION both ride the bone's pose, but they take DIFFERENT
-    // parts of it — treating them as symmetric is a regression waiting to
-    // happen, and it broke every gun once already.
-    //
-    // Position: `src` is the attachment origin PLUS its parent bone's
-    // model-space position (on a gun the attachment hangs off `weapon_offset`,
-    // a child of `weapon`, and `weapon` carries the real offset — 18.23, -0.19,
-    // 12.40 on the M4). That lands in bind space, and the body's vertices were
-    // baked through the inventory_icon clip, which translates the weapon to the
-    // origin (measured: raw geometry spans 1.39..36.77 inches yet the baked box
-    // comes out centred with center ~= 0). The pose makes the same trip:
-    // bind MODEL INCHES -> baked WORLD metres. No `center` correction —
-    // object.position applies -center to geometry and module alike.
-    if (bonePose) {
-      mod.position.set(src[0], src[1], src[2]).applyMatrix4(bonePose);
-    } else {
-      mod.position.set(pos[0], pos[1], pos[2]);
-    }
-    // Rotation must NOT be the pose's rotation WHOLE. That matrix carries the
-    // glb node matrix (the model->world axis swizzle), and the module's OWN glb
-    // node already applies the identical swizzle — taking the rotation from it
-    // applies the swap twice and stands the module on end. On the M4, whose
-    // anchor angles are exactly [0,0,0], that turned a correct horizontal
-    // readout into a vertical black bar.
-    //
-    // Divide the swizzle out and what is left is the rotation the CLIP applied,
-    // which the module does have to share: it is bolted to the gun, so if the
-    // pose turns the gun the module turns with it. On guns that residual
-    // measures 0.05-0.09 degrees — the pose is a pure translation and this stays
-    // the no-op it has always been. On the elite's `weapon_r` it is 65 degrees,
-    // and without it the module hangs beside the pistol at a visibly wrong
-    // angle.
-    //
-    // Onto that goes the attachment's own tilt, swizzled to match the position
-    // (glb x,y,z = model y,z,x). Every GUN anchor is unrotated, so that half is
-    // unconstrained by guns — which is exactly why knives (karambit
-    // [-54.1, 0, -170.4]) do not work yet and stay gated above.
-    const clipQuat = clipRotation(THREE, bonePose, poseBones.modelQuat) ?? new THREE.Quaternion();
-    mod.quaternion
-      .copy(clipQuat)
-      .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(euler[1], euler[2], euler[0], "ZYX")));
-
-    // ---- Seat it against the body -------------------------------------------
-    // The anchor is validated (muzzle_flash lands 2cm past the barrel on a 90cm
-    // gun, shell_eject on the correct side), but an attachment point is not a
-    // surface: CS2 mounts the module flush and ours reads as floating a
-    // centimetre proud. The charm gets away with the same anchor space because
-    // it DANGLES — a bolted-on module cannot.
-    //
-    // So cast inward along the side axis and slide the module's inner face onto
-    // whatever it hits. Render-only, exactly like liftOutOfBody: no stored
-    // value is touched, so this cannot desync from what the game is sent.
-    {
-      const outward = pos[0] >= 0 ? 1 : -1;
-      // Extent about the module's OWN origin, with its tilt already applied.
-      const self = new THREE.Box3().setFromObject(mod).translate(mod.position.clone().negate());
-      const innerFace = outward > 0 ? self.min.x : self.max.x;
-      const probe = 0.06;
-      const dirWorld = new THREE.Vector3(-outward, 0, 0).transformDirection(object.matrixWorld).normalize();
-      const start = object.localToWorld(new THREE.Vector3(pos[0] + outward * probe, pos[1], pos[2]));
-      raycaster.set(start, dirWorld);
-      raycaster.far = probe * 2;
-      const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
-      if (hit) {
-        const surfaceX = object.worldToLocal(hit.point.clone()).x;
-        // The knife module is a FLAT plate (measured: y extent exactly 0), so
-        // its inner face IS its outer face. Seating that dead on the surface
-        // z-fights; lift it by a fraction of a millimetre.
-        const bias = Math.abs(self.max.x - self.min.x) < 1e-5 ? outward * 0.0002 : 0;
-        const seated = surfaceX - innerFace + bias;
-        // Cap the correction. A ray that slips through a gap (the magwell
-        // opening sits right below this anchor on an M4) would otherwise drag
-        // the module deep into the receiver — far worse than leaving it proud.
-        if (Math.abs(seated - pos[0]) <= 0.02) mod.position.x = seated;
-      }
-    }
+    if (!placeAttachedModule(mod, anchor, bone)) return;
     object.add(mod);
     stattrakMod = mod;
     object.updateMatrixWorld(true);
@@ -5277,6 +5331,129 @@ vec3 csCharmAdjust( vec3 linear ) {
    * block: the GEOMETRY belongs to the shared glTF cache and must not be
    * touched — only the material clone and its digit canvases are ours.
    */
+  // ---- Name tag plate ----------------------------------------------------------
+  /**
+   * The engraved plate a Name Tag puts on the weapon.
+   *
+   * Static, unlike a charm: every weapon carries a hand-authored `nametag`
+   * attachment in its own vmdl (36/36 here, plus `nametag_legacy` for the
+   * legacy body), and the item data has no offset field for it — the plate goes
+   * where the model says and there is nothing to drag.
+   *
+   * Placed through placeAttachedModule, exactly as the StatTrak module is. A
+   * first pass used the CHARM convention instead — swizzle the origin to metres
+   * and subtract `center` — which put the plate in mid-air beside the receiver:
+   * charm anchors live in world space and skip the bind pose, and they need a
+   * per-weapon calibration for the residual. A bolted-on module has to go
+   * through the bind pose like the body did.
+   *
+   * Unlike StatTrak this exercises the ROTATION path for real: its gun anchors
+   * are all unrotated, while 36 of the 37 nametag anchors are rotated and some
+   * hard (Deagle [80.3, -179.2, -179.0]).
+   */
+  /**
+   * The plate's colour map with the serial line replaced by the custom name.
+   *
+   * The shipped texture is an atlas — a black label strip reading
+   * "PARKER / INVENTORY UID DATAPLATE SERIAL NO / barcode", a plain metal back
+   * face, and two rivets. Measured on the 512x512 map, the serial line occupies
+   * x 111..297, y 74..95; the logo sits to its left and the barcode to its
+   * right, so the name goes exactly there and nothing else is disturbed.
+   *
+   * Sampler settings are copied off the texture being replaced rather than set
+   * by hand — flipY in particular, which differs between a glTF texture and a
+   * canvas and silently renders the engraving upside down.
+   */
+  function nameplateTexture(text: string, src: import("three").Texture | null) {
+    const img = src?.image as (CanvasImageSource & { width: number; height: number }) | undefined;
+    if (!img?.width) return null;
+    const cv = document.createElement("canvas");
+    cv.width = img.width;
+    cv.height = img.height;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0);
+    // Box in the 512-wide authored space, scaled to whatever the mount ships.
+    const k = img.width / 512;
+    const box = { x: 111 * k, y: 74 * k, w: (297 - 111) * k, h: (95 - 74) * k };
+    // Paint out the serial with the label's own background, sampled from just
+    // under the line rather than assumed black — the strip is not flat.
+    const bg = ctx.getImageData(Math.round(box.x + box.w * 0.5), Math.round(box.y + box.h + 4 * k), 1, 1).data;
+    ctx.fillStyle = `rgb(${bg[0]},${bg[1]},${bg[2]})`;
+    ctx.fillRect(box.x - 2 * k, box.y - 2 * k, box.w + 4 * k, box.h + 4 * k);
+    // Fit to the box: names run to 24 characters and the plate is narrow, so
+    // size is driven by what fits rather than by a fixed point size.
+    const label = text.toUpperCase();
+    let size = box.h;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (; size > 4; size -= 0.5) {
+      ctx.font = `${size}px "Arial Narrow", "Roboto Condensed", "DejaVu Sans Condensed", sans-serif`;
+      if (ctx.measureText(label).width <= box.w) break;
+    }
+    ctx.fillStyle = "#d8d5cd"; // the serial line's own ink, not pure white
+    ctx.fillText(label, box.x + box.w / 2, box.y + box.h / 2, box.w);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.flipY = src!.flipY;
+    tex.colorSpace = src!.colorSpace;
+    tex.wrapS = src!.wrapS;
+    tex.wrapT = src!.wrapT;
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  const nametagDisposables: { dispose: () => void }[] = [];
+  let nametagMod: import("three").Object3D | null = null;
+  async function mountNameTag(text: string) {
+    const picked = pickAnchor(
+      NAMETAG_ANCHORS as Record<string, import("./stattrakModule").StatTrakAnchorSet | undefined>,
+      model,
+      !!opts?.legacyPaint,
+    );
+    if (!picked) return; // no nametag attachment on this model
+    let modGltf;
+    try {
+      modGltf = await loadGltf(NAMETAG_GLB, { legacy: false, painted: false });
+    } catch {
+      return; // plate art missing from the mount — render the weapon regardless
+    }
+    const mod = modGltf.scene.clone(true);
+    // The engraved face is drawn per item, so its material can never be the
+    // shared one out of the glTF cache.
+    mod.traverse((child) => {
+      const mesh = child as import("three").Mesh;
+      if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
+      const mat = (mesh.material as import("three").MeshStandardMaterial)?.clone();
+      if (!mat) return;
+      const label = nameplateTexture(text, mat.map);
+      if (label) {
+        mat.map = label;
+        nametagDisposables.push(label);
+      }
+      mat.needsUpdate = true;
+      mesh.material = mat;
+      nametagDisposables.push(mat);
+    });
+    if (!placeAttachedModule(mod, picked.anchor, picked.bone, true)) return;
+    object.add(mod);
+    nametagMod = mod;
+  }
+
+  function removeNameTag() {
+    if (nametagMod) {
+      object.remove(nametagMod);
+      nametagMod = null;
+    }
+    for (const d of nametagDisposables) d.dispose();
+    nametagDisposables.length = 0;
+  }
+
+  /** Swap the plate on a live viewer, the way setStatTrak does. */
+  async function setNameTag(text: string | null) {
+    removeNameTag();
+    if (text && text.trim()) await mountNameTag(text.trim());
+  }
+
   function removeStatTrak() {
     if (stattrakMod) {
       object.remove(stattrakMod);
@@ -5311,6 +5488,9 @@ vec3 csCharmAdjust( vec3 linear ) {
   // one. The GLB is ~26KB and cached after the first item, so the cost is a
   // one-time fetch rather than a per-viewer stall.
   if (opts?.stattrak) await mountStatTrak(opts.stattrak);
+  // Awaited for the same reason as the module: a card baked before the plate
+  // loads would be cached as though the weapon had no name on it.
+  if (opts?.nametag) await mountNameTag(opts.nametag.trim());
   mt.mark("attach");
 
   // ---- Perf HUD ----------------------------------------------------------------
@@ -5552,6 +5732,7 @@ vec3 csCharmAdjust( vec3 linear ) {
 
   return {
     setStatTrak: (spec) => void setStatTrak(spec),
+    setNameTag: (text) => void setNameTag(text),
     setStickers,
     flashSticker,
     setCharm: (c) => void setCharm(c),

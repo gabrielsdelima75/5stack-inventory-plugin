@@ -201,7 +201,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
         <!-- Inline, not stacked: the stacked variant spends a second line on
              the float/seed readout, which is the difference between a row that
              fits the budget below and one that doesn't. -->
-        <WearBar :wear="inst.wear" :seed="inst.seed" inline compact class="mt-1" />
+        <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" inline compact class="mt-1" />
       </div>
       <span class="relative z-[2] flex flex-none items-center gap-1.5">
         <TeamDots :teams="equippedTeams" />
@@ -277,7 +277,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       </span>
     </div>
 
-    <WearBar :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
+    <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
     </template>
   </button>
 </template>

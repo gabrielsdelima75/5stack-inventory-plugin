@@ -776,7 +776,9 @@ app.get<{ Querystring: { slot?: string } }>(
       return { base: null, skins: getMusicKits() };
     }
     if (slot === "graffiti") {
-      return { base: null, skins: getGraffiti() };
+      // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
+      // graffiti is the one catalog whose splits aren't in any item field.
+      return { base: null, ...getGraffiti() };
     }
     if (slot === "zeus") {
       return getWeaponSkins("taser");
@@ -1739,6 +1741,22 @@ function nametagOf(desc: SteamDescription | undefined): string | null {
   return null;
 }
 
+// When (if ever) this account last pulled its Steam inventory. The UI marks the
+// sync button until this comes back non-null — a brand new account's inventory
+// is empty and there is nothing on screen to suggest Steam is where it fills up
+// from. Cheap enough to sit alongside the inventory load.
+app.get("/api/inventory/steam-sync", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{ synced_at: Date }>(
+    `SELECT synced_at FROM inventory.steam_sync WHERE steam_id = $1`,
+    [identity.steamId],
+  );
+  return { syncedAt: rows[0]?.synced_at?.toISOString() ?? null };
+});
+
 app.post("/api/inventory/import-steam", async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
@@ -1846,6 +1864,14 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     );
     removed = rowCount ?? 0;
   }
+  // Mark the account as synced. Written even when nothing was imported — the
+  // point is "you have done this", not "you own Steam items" — but only after
+  // the fetch itself succeeded, so a failed sync leaves the nag in place.
+  await pool.query(
+    `INSERT INTO inventory.steam_sync (steam_id, synced_at) VALUES ($1, now())
+     ON CONFLICT (steam_id) DO UPDATE SET synced_at = now()`,
+    [identity.steamId],
+  );
   app.log.info(
     `[steam-sync] ${identity.steamId}: ${assets.length} assets` +
       `${complete ? "" : " (PARTIAL read)"} — ${imported} added, ${updated} updated, ` +
