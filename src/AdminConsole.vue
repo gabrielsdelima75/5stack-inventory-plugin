@@ -142,6 +142,15 @@ const fmtDuration = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${String(s
 // count, the CPU and the disk, and one panel took half an hour.
 const extractDurationHint =
   "Takes a long time — how long depends on the worker count and this machine's CPU and disk.";
+// Two files record the same event and either can be the only survivor.
+// `finishedAt` is the backend's — it exists only if this process was still
+// around when the child exited, and a restart mid-run (pod bounce, `node
+// --watch` reload) leaves the reparented script to finish without it. The
+// stamp's `lastRunAt` is the script's own, so it's there whenever a duration
+// is. Preferring `finishedAt` keeps a FAILED run (which stamps nothing) as the
+// last run; falling back stops a completed run reading as "never · 7m 27s".
+const lastRunAt = computed(() => extractStatus.value?.finishedAt ?? extractStatus.value?.lastRunAt ?? null);
+
 // The two heaviest steps, which is the actionable part — a bare total tells you
 // the run is long but not which stage to blame.
 const slowestSteps = computed(() => {
@@ -954,8 +963,8 @@ const BTN_DANGER =
                 <div class="flex items-start justify-between gap-4 px-4 py-3">
                   <dt class="text-sm text-muted-foreground">Last run</dt>
                   <dd class="text-right">
-                    <span class="font-mono text-sm" :class="extractStatus.finishedAt ? '' : 'text-muted-foreground'">
-                      {{ extractStatus.finishedAt ? new Date(extractStatus.finishedAt).toLocaleString() : "never" }}
+                    <span class="font-mono text-sm" :class="lastRunAt ? '' : 'text-muted-foreground'">
+                      {{ lastRunAt ? new Date(lastRunAt).toLocaleString() : "never" }}
                       <template v-if="extractStatus.lastRunSeconds != null">
                         <span class="text-muted-foreground">·</span>
                         {{ fmtDuration(extractStatus.lastRunSeconds) }}

@@ -73,7 +73,7 @@ import InfiniteSentinel from "./InfiniteSentinel.vue";
 import SortDirection from "./SortDirection.vue";
 import ViewerControls from "./ViewerControls.vue";
 import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
-import { attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, wearTier } from "./itemVisuals";
+import { ART_FADE_B, attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, wearTier } from "./itemVisuals";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller } from "./dom";
 import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
@@ -1312,6 +1312,17 @@ const craftInst = computed(() =>
   craftInstId.value != null ? instanceById(craftInstId.value) ?? null : null,
 );
 /**
+ * Does the preview need the waist-crop feather (ART_FADE_B)? Three ways into
+ * this modal and only two of them carry a type: an owned item and a shared
+ * craft link (/catalog/items) both know it, while the sheet's catalog listing
+ * doesn't — there the selected slot is the answer. Type first, so opening a
+ * weapon link while the agent slot happens to be selected doesn't mask a barrel.
+ */
+const craftIsAgent = computed(() => {
+  const type = craft.value?.skin.type ?? craftInst.value?.item?.type;
+  return type ? type === "agent" : selected.value === "agent";
+});
+/**
  * View → edit, in place. Same item, same modal, form swapped back in.
  *
  * A MODE FLIP, not a reload — deliberately not `openEdit`. `craft` already
@@ -1960,7 +1971,10 @@ function setStickerWear(slot: number, w: number) {
 }
 function craftCharmPlacement(): CharmPlacement | null {
   const c = craft.value?.charm;
-  return c?.image ? { image: c.image, x: c.x ?? null, y: c.y ?? null, z: c.z ?? null } : null;
+  // The seed goes to the RENDERER too, not just the game server: a charm's
+  // pattern drives real shader params (hue, saturation, brightness) on 36 of the
+  // 89 keychain materials.
+  return c?.image ? { image: c.image, x: c.x ?? null, y: c.y ?? null, z: c.z ?? null, seed: c.seed ?? null } : null;
 }
 async function mountModalViewer() {
   teardownModalViewer();
@@ -3375,6 +3389,13 @@ const SHEET_ENTRY = computed(() =>
 const SHEET_ART = computed(() =>
   sheetRows.value ? "grid h-11 w-14 flex-none place-items-center rounded bg-background/40" : CARD_ART,
 );
+// ...and their LABEL has to flip with them. `flex-1` on the caption is right in
+// the row layout (it takes the width left over beside the thumb) and actively
+// wrong in the card layout, where the same class makes the caption claim an
+// equal share of the COLUMN — it split every default card 50/50 and left the
+// art half-height, so a stock M4A4 drew ~35% smaller than the crafted M4A4
+// next to it and read as broken art rather than as a deliberate "no skin".
+const SHEET_LABEL = computed(() => (sheetRows.value ? "min-w-0 flex-1" : "min-w-0 w-full flex-none"));
 
 // ---- "there is more below" --------------------------------------------------
 // The picker is a short scroller inside a sheet inside a page; none of the
@@ -5495,6 +5516,7 @@ if (MDEBUG) {
                   alt=""
                   :class="cn(
                     'relative z-[2] max-h-full max-w-full object-contain p-1 transition-opacity',
+                    it.pos === 'agent' && ART_FADE_B,
                     !it.rarity && 'opacity-50 group-hover:opacity-80',
                   )"
                 />
@@ -5572,7 +5594,7 @@ if (MDEBUG) {
                     v-if="specialImage(s.slot)"
                     :inst="cellInstance(s.slot)"
                     :image="specialImage(s.slot)"
-                    :class="cn('max-h-full max-w-full object-contain', !rowFor(s.slot) && 'opacity-60')"
+                    :class="cn('max-h-full max-w-full object-contain', s.slot === 'agent' && ART_FADE_B, !rowFor(s.slot) && 'opacity-60')"
                   />
                   <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
                 </div>
@@ -5733,7 +5755,7 @@ if (MDEBUG) {
                   v-if="specialImage('agent')"
                   :inst="cellInstance('agent')"
                   :image="specialImage('agent')"
-                  :class="cn('max-h-full max-w-full object-contain', !rowFor('agent') && 'opacity-70')"
+                  :class="cn('max-h-full max-w-full object-contain', ART_FADE_B, !rowFor('agent') && 'opacity-70')"
                   style="filter: drop-shadow(0 10px 16px rgba(0,0,0,0.5))"
                 />
                 <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
@@ -6495,9 +6517,14 @@ if (MDEBUG) {
               @click="clearSlot(selected)"
             >
               <div :class="SHEET_ART">
-                <img :src="specialDefault(selected)?.image ?? undefined" alt="" class="max-h-full max-w-full object-contain opacity-80" />
+                <img
+                  :src="specialDefault(selected)?.image ?? undefined"
+                  alt=""
+                  class="max-h-full max-w-full object-contain"
+                  :class="selected === 'agent' && ART_FADE_B"
+                />
               </div>
-              <div class="min-w-0 flex-1">
+              <div :class="SHEET_LABEL">
                 <div class="truncate text-f13 font-medium text-muted-foreground">{{ specialDefault(selected)?.name ?? 'Default' }}</div>
                 <div class="text-f9 uppercase tracking-cs1 text-muted-foreground/60">Default · {{ isShared(selected) ? 'CT + T' : team }}</div>
               </div>
@@ -6511,9 +6538,9 @@ if (MDEBUG) {
               @click="equipDefaultAt(occupantWeapon(selected)!, selected)"
             >
               <div :class="SHEET_ART">
-                <img :src="occupantWeapon(selected)!.image ?? undefined" alt="" class="max-h-full max-w-full object-contain opacity-70" />
+                <img :src="occupantWeapon(selected)!.image ?? undefined" alt="" class="max-h-full max-w-full object-contain" />
               </div>
-              <div class="min-w-0 flex-1 truncate text-f13 font-medium text-muted-foreground">Default</div>
+              <div :class="[SHEET_LABEL, 'truncate text-f13 font-medium text-muted-foreground']">Default</div>
             </button>
             <!-- draggable: drop it on any eligible loadout slot (grid, rail,
                  focus rail) — clicking still equips into the selected slot.
@@ -6568,7 +6595,13 @@ if (MDEBUG) {
                   <Hammer class="h-2.5 w-2.5" /> Craft
                 </span>
                 <div :class="CARD_ART">
-                  <img :src="s.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105" />
+                  <img
+                    :src="s.image ?? undefined"
+                    alt=""
+                    loading="lazy"
+                    class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
+                    :class="sheetKey === 'agent' && ART_FADE_B"
+                  />
                 </div>
                 <ItemName :item="s" strip class="relative z-[2]" />
               </button>
@@ -6595,9 +6628,9 @@ if (MDEBUG) {
               @click="equipDefaultAt(w, selected)"
             >
               <div :class="SHEET_ART">
-                <img :src="w.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain opacity-80" />
+                <img :src="w.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain" />
               </div>
-              <div class="min-w-0 flex-1">
+              <div :class="SHEET_LABEL">
                 <div class="truncate text-f13 font-medium">{{ w.name }}</div>
                 <div class="mt-0.5 text-f8 uppercase tracking-wider text-muted-foreground/60">Default</div>
               </div>
@@ -6619,7 +6652,7 @@ if (MDEBUG) {
               <div :class="[SHEET_ART, 'relative z-[2]']">
                 <img :src="i.item?.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain" />
               </div>
-              <div class="relative z-[2] flex min-w-0 flex-1 items-center gap-1.5">
+              <div :class="[SHEET_LABEL, 'relative z-[2] flex items-center gap-1.5']">
                 <span class="truncate text-f13 font-medium">{{ itemName(i.item) }}</span>
                 <span v-if="i.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
               </div>
@@ -6804,7 +6837,13 @@ if (MDEBUG) {
                    both, so wear/pattern/name tag/StatTrak are always reachable
                    — the old fullscreen 3D overlay hid all of them. -->
               <div v-show="!modal3d" class="relative z-[2] flex h-full w-full items-center justify-center">
-                <img :src="craftPreview ?? craft.skin.image ?? undefined" alt="" class="max-h-full max-w-full object-contain drop-shadow-[0_28px_30px_rgba(0,0,0,0.45)]" @error="craftPreview = null" />
+                <img
+                  :src="craftPreview ?? craft.skin.image ?? undefined"
+                  alt=""
+                  class="max-h-full max-w-full object-contain drop-shadow-[0_28px_30px_rgba(0,0,0,0.45)]"
+                  :class="craftIsAgent && ART_FADE_B"
+                  @error="craftPreview = null"
+                />
               </div>
               <!-- absolute, not h-full: the canvas is height:100%, so against a
                    flex-sized (indefinite) host it falls back to its drawing-

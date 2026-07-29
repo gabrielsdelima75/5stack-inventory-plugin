@@ -28492,3 +28492,18 @@ Exception: ValveResourceFormat.Utils.UnexpectedMagicException: Only VCS file ver
    at CLI.Decompiler.DecompileResource(Resource resource, IFileLoader fileLoader) in /_/CLI/Decompiler.cs:line 771
    at CLI.Decompiler.ProcessVPKEntries(String parentPath, Package package, IFileLoader fileLoader, String type, Dictionary`2 manifestData) in /_/CLI/Decompiler.cs:line 1348
 
+---------------
+Parent file: /cs2-game/game/csgo/pak01_dir.vpk
+File: weapons/models/shared/shells/ak47/ak47_casing.vmdl_c
+Exception: System.AggregateException: One or more errors occurred. (Failed to create ORM texture bitmap)
+ ---> System.InvalidOperationException: Failed to create ORM texture bitmap
+   at ValveResourceFormat.IO.GltfModelExporter.<>c__DisplayClass83_0.<<GenerateGLTFMaterialFromRenderMaterial>g__AddTextureORM|4>d.MoveNext() in /_/ValveResourceFormat/IO/GltfModelExporter.Material.cs:line 373
+   --- End of inner exception stack trace ---
+   at System.Threading.Tasks.Task.WaitAllCore(ReadOnlySpan`1 tasks, Int32 millisecondsTimeout, CancellationToken cancellationToken)
+   at System.Threading.Tasks.Task.WaitAll(IEnumerable`1 tasks, CancellationToken cancellationToken)
+   at ValveResourceFormat.IO.GltfModelExporter.WaitForTexturesToExport() in /_/ValveResourceFormat/IO/GltfModelExporter.Material.cs:line 544
+   at ValveResourceFormat.IO.GltfModelExporter.ExportToFile(String resourceName, String fileName, Model model) in /_/ValveResourceFormat/IO/GltfModelExporter.cs:line 569
+   at ValveResourceFormat.IO.GltfModelExporter.<>c__DisplayClass48_0.<Export>b__0() in /_/ValveResourceFormat/IO/GltfModelExporter.cs:line 190
+   at ValveResourceFormat.IO.GltfModelExporter.RunExport(Action exportAction, String targetPath, CancellationToken cancellationToken) in /_/ValveResourceFormat/IO/GltfModelExporter.cs:line 156
+   at CLI.Decompiler.ProcessVPKEntries(String parentPath, Package package, IFileLoader fileLoader, String type, Dictionary`2 manifestData) in /_/CLI/Decompiler.cs:line 1339
+

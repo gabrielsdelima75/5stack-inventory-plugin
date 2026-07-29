@@ -116,6 +116,11 @@ export function getAgents() {
     .map((a) => ({
       id: a.id,
       name: a.name,
+      // Same as every other catalog listing: without it the craft sheet draws
+      // agents with no rarity rule and no glow, so they were the one slot whose
+      // tiles changed appearance the moment you equipped them (the equipped
+      // instance resolves rarity through getItem).
+      rarity: a.rarity as string,
       teams: teamsOf(a),
       image: img(a.image),
     }));

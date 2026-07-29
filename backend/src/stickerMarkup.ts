@@ -171,6 +171,19 @@ export interface CharmShading {
    *  `g_fTextureRoughnessBrightness` / `Contrast`. */
   roughness?: number;
   roughnessOffset?: number;
+  /**
+   * SEED-DRIVEN params, as decoded expression trees keyed by shader param name.
+   *
+   * A charm's pattern drives real shader params on 36 of the 89 keychain
+   * materials — Semi-Precious is `g_fHueShift = lerp(0, -160, $KeychainSeed)`.
+   * Nodes are `{ f: "lerp" | "frac" | "+" | ... , a: [...] }` with plain numbers
+   * as leaves and `{ f: "seed" }` for the pattern itself; see the charm-models
+   * step in extract-models.sh.
+   *
+   * Passed through verbatim rather than interpreted here: the renderer is the
+   * only thing that knows which params it can honour.
+   */
+  dynamic?: Record<string, unknown>;
 }
 
 const CHARM_FILE = path.join(MODELS_DIR, "charm-models.json");
@@ -193,6 +206,9 @@ export async function getCharmShading(): Promise<Record<string, CharmShading>> {
       for (const key of ["metalness", "roughness", "roughnessOffset"] as const) {
         const v = Number(e[key]);
         if (Number.isFinite(v)) out[key] = v;
+      }
+      if (e.dynamic && typeof e.dynamic === "object" && !Array.isArray(e.dynamic)) {
+        out.dynamic = e.dynamic as Record<string, unknown>;
       }
       if (Object.keys(out).length) map[stem] = out;
     }

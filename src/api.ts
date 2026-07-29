@@ -614,6 +614,10 @@ export interface ExtractStatus {
    *  Null on mounts stamped before v5 — "unknown", not zero. */
   lastRunSeconds?: number | null;
   lastRunSteps?: Record<string, number> | null;
+  /** When the last successful run finished, per the script's own stamp — use
+   *  this in preference to `finishedAt`, which is only written if the backend
+   *  outlived the run it started. */
+  lastRunAt?: string | null;
   /** Live progress while a run is going: every step of the pipeline with its
    *  own state, plus a unit count for the steps that know one. The whole list
    *  is present from the start so the panel can show what's still to come. */

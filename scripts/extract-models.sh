@@ -92,6 +92,15 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v17 (2026-07-29): charm-shading.json gains `dynamic` — the SEED-DRIVEN shader
+# params, decoded from each keychain vmat's Source 2 dynamic-expression
+# bytecode. A charm's pattern is not just a tradeable number: 36 of the 89
+# materials drive real params from `$KeychainSeed`, and Semi-Precious is
+# `g_fHueShift = lerp(0, -160, $KeychainSeed)` — the entire green-to-purple ramp
+# players catalogue by pattern. Decoded to an AST, not special-cased per charm.
+# Also TIGHT-CROPS charm icons: they ship as a narrow vertical charm floating in
+# a 512x384 landscape canvas (the art is 26% of the width, 22% on the crystal),
+# so a square UI tile drew the charm at roughly an eighth of its area.
 # v16 (2026-07-29): charm-shading.json (step 3e) — the per-material metalness
 # remap and roughness adjust from each keychain vmat. The GLB carries the raw
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
@@ -109,7 +118,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=16
+EXTRACT_VERSION=17
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -1617,7 +1626,7 @@ ITEMS_GAME="$(find "$WORK/raw_items" -name items_game.txt | head -1)"
 "$CLI" -i "$VPK" -f "weapons/keychains/" -e vmat_c -b DATA >"$WORK/charm-vmats.txt" 2>/dev/null || true
 CHARM_SHADING="$WORK/charm-vmats.txt" \
 ITEMS_GAME="$ITEMS_GAME" DEST="$DEST" CHARM_MATS="$WORK/charm-materials.json" python3 - <<'PYEOF'
-import hashlib, json, os, re
+import hashlib, json, os, re, struct
 
 src, dest = os.environ.get("ITEMS_GAME", ""), os.environ["DEST"]
 KV = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"\s*$')
@@ -1713,6 +1722,60 @@ def num(block, param, key):
     return float(m.group(1)) if m else None
 
 
+# Source 2 dynamic-expression VM, enough of it to read what charms actually use.
+# Opcode and function tables are VfxEval's (ValveResourceFormat/Serialization).
+_VFX_FUNCS = [("sin",1),("cos",1),("tan",1),("frac",1),("floor",1),("ceil",1),
+              ("saturate",1),("clamp",3),("lerp",3),("dot4",2),("dot3",2),("dot2",2),
+              ("log",1),("log2",1),("log10",1),("exp",1),("exp2",1),("sqrt",1),
+              ("rsqrt",1),("sign",1),("abs",1),("pow",2),("step",2),("smoothstep",3),
+              ("float4",4),("float3",3),("float2",2),("time",0),("min",2),("max",2),
+              ("SrgbLinearToGamma",1),("SrgbGammaToLinear",1),("random",2),
+              ("normalize",1),("length",1),("sqr",1),("rotation2d",1),("rotate2d",2),
+              ("sincos",1),("TextureSize",1),("TextureAverageColor",1)]
+_VFX_BINOPS = {0x13:"+",0x14:"-",0x15:"*",0x16:"/",0x17:"%"}
+# Murmur token for the one render attribute charms use.
+_VFX_KEYCHAIN_SEED = 0x8BEF1EF6
+
+
+def vfx_decode(code):
+    """Bytecode -> JSON AST. Numbers stay numbers; nodes are {"f": name, "a": [...]}."""
+    stack = []
+    i = 0
+    while i < len(code):
+        op = code[i]
+        i += 1
+        if op == 0x00:  # RETURN
+            break
+        if op == 0x07:  # FLOAT literal
+            stack.append(round(struct.unpack_from("<f", code, i)[0], 6))
+            i += 4
+        elif op == 0x18:  # NEGATE
+            v = stack.pop()
+            stack.append(-v if isinstance(v, (int, float)) else {"f": "neg", "a": [v]})
+        elif op == 0x19:  # ATTRIBUTE
+            tok = struct.unpack_from("<I", code, i)[0]
+            i += 4
+            if tok != _VFX_KEYCHAIN_SEED:
+                raise ValueError(f"unknown render attribute {tok:08x}")
+            stack.append({"f": "seed", "a": []})
+        elif op == 0x06:  # FUNC
+            fid, check = code[i], code[i + 1]
+            i += 2
+            if check != 0 or fid >= len(_VFX_FUNCS):
+                raise ValueError(f"bad function id {fid:#x}")
+            name, argc = _VFX_FUNCS[fid]
+            args = [stack.pop() for _ in range(argc)][::-1]
+            stack.append({"f": name, "a": args})
+        elif op in _VFX_BINOPS:
+            b, a = stack.pop(), stack.pop()
+            stack.append({"f": _VFX_BINOPS[op], "a": [a, b]})
+        else:
+            raise ValueError(f"unhandled opcode {op:#x}")
+    if not stack:
+        raise ValueError("empty expression")
+    return stack[-1]
+
+
 shading = {}
 for block in BLOCKS:
     named = re.search(r'm_materialName = "([^"]+)"', block)
@@ -1744,6 +1807,29 @@ for block in BLOCKS:
         if abs(scale - 1) > 1e-4 or abs(offset) > 1e-4:
             entry["roughness"] = round(scale, 4)
             entry["roughnessOffset"] = round(offset, 4)
+    # ---- Seed-driven params ---------------------------------------------
+    #
+    # A charm's PATTERN is not just a tradeable number: 36 of the 89 keychain
+    # materials on this build drive real shader params from it. Semi-Precious is
+    # `g_fHueShift = lerp(0, -160, $KeychainSeed)`, which is the whole
+    # green-teal-cyan-blue-purple ramp players catalogue by pattern.
+    #
+    # The vmat stores these as Source 2 dynamic-expression BYTECODE
+    # (`m_dynamicParams`, with `m_renderAttributesUsed = ["$KeychainSeed"]`),
+    # which is why the KV3 blob token added in v15 matters here. Decoded to a
+    # tiny AST rather than special-cased per charm — the whole language in use is
+    # lerp/frac/float2, four arithmetic ops and negate, so one decoder covers
+    # every charm that exists now and any Valve ships later.
+    dyn = re.search(r"m_dynamicParams\s*=\s*\[(.*?)\n\t\]", block, re.S)
+    if dyn:
+        exprs = {}
+        for pm in re.finditer(r'm_name = "([^"]+)"\s*\n\s*m_value = #\[([0-9A-Fa-f\s]*)\]', dyn.group(1)):
+            try:
+                exprs[pm.group(1)] = vfx_decode(bytes.fromhex("".join(pm.group(2).split())))
+            except Exception as exc:  # a param we cannot read must not kill the run
+                print(f"!!! {stem}: cannot decode dynamic {pm.group(1)}: {exc}")
+        if exprs:
+            entry["dynamic"] = exprs
     if entry:
         shading[stem] = entry
 
@@ -1956,8 +2042,20 @@ print(f"---   {len(manifest)} icons wanted, {len(wanted)} distinct archive asset
 # The previous approach unpacked whole econ subtrees, which decompiled ~19k
 # assets we never use (and made `stickers` a single 8.5k-asset serial stall).
 
-def convert(src, out, tint):
+def convert(src, out, tint, crop=False):
     dst = os.path.join(dest, out)
+    # CHARM icons are a narrow vertical charm floating in a 512x384 landscape
+    # canvas — measured, the art is 26% of the width and 74% of the height, and
+    # on the crystal only 22% wide. Fitted into a square UI tile that letterboxes
+    # to 32x24 and then draws the charm at about 8x18: a seventh of the tile,
+    # which is why an equipped charm was unreadable at every size we show it.
+    #
+    # Trimmed here rather than zoomed in CSS because the padding is not uniform
+    # across charms (the USP jewel is 50% x 53%), so any fixed transform that
+    # fills one clips another. Trimming makes the icon BE the charm, and every
+    # surface — slot, picker, tile chip — gets it for free.
+    trim = ["-bordercolor", "none", "-fuzz", "1%", "-trim", "+repage",
+            "-bordercolor", "none", "-border", "3%"] if crop else []
     if tint:
         # Multiply, not -colorize: the stencils carry internal shading (measured
         # weighted luminance 0.49, not a flat 1.0), and colorize would flatten
@@ -1967,9 +2065,9 @@ def convert(src, out, tint):
                "(", "+clone", "-alpha", "off", "-fill", f"#{tint}", "-colorize", "100", ")",
                "-compose", "Multiply", "-composite",
                "(", src, "-alpha", "extract", ")", "-compose", "CopyOpacity", "-composite",
-               "-quality", "85", dst]
+               *trim, "-quality", "85", dst]
     else:
-        cmd = ["convert", src, "-quality", "85", dst]
+        cmd = ["convert", src, *trim, "-quality", "85", dst]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         return True
@@ -2053,16 +2151,18 @@ for bi in range(0, len(todo_paths), BATCH):
         if src is None:
             failed.extend(o for o, _ in wanted[path])
             continue
+        # `econ/keychains/...` is the charm namespace in the econ schema.
+        crop = "/keychains/" in path
         for out, tint in wanted[path]:
             if not have_convert:
                 shutil.copyfile(src, os.path.join(dest, out.replace(".webp", ".png")))
                 written += 1
             else:
-                jobs.append((src, out, tint))
+                jobs.append((src, out, tint, crop))
 
     if jobs:
         with ThreadPoolExecutor(max_workers=pool_size(CORES)) as pool:
-            for ok, (_, out, _) in zip(pool.map(lambda j: convert(*j), jobs), jobs):
+            for ok, (_, out, _, _) in zip(pool.map(lambda j: convert(*j), jobs), jobs):
                 if ok:
                     written += 1
                 else:

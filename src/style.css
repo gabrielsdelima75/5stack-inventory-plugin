@@ -136,6 +136,27 @@
     animation: cs2Sheen 1.2s linear infinite;
   }
 }
+/* Agent artwork is a waist-up crop: Valve's inventory icon ends mid-torso, so
+   an art well that draws it at full height finishes on a hard horizontal cut
+   where every other item type is a whole object floating in space. Feather the
+   last fifth into the card instead.
+   Per-ITEM, never on the well: a weapon's silhouette runs right to the edge of
+   its art, and masking that would dissolve the barrel. */
+@layer components {
+  [data-cs2-inventory] .art-fade-b {
+    /* Four stops, not two: a linear ramp still reads as a band. */
+    -webkit-mask-image: linear-gradient(to bottom, #000 72%, rgba(0, 0, 0, 0.72) 85%, rgba(0, 0, 0, 0.26) 94%, transparent 100%);
+    mask-image: linear-gradient(to bottom, #000 72%, rgba(0, 0, 0, 0.72) 85%, rgba(0, 0, 0, 0.26) 94%, transparent 100%);
+    /* `repeat` is the initial value, and it tiles the ramp over anything a
+       filter paints outside the box — the agent cell's drop-shadow came back as
+       a banded blob under the fade. no-repeat masks that shadow out with it. */
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-size: 100% 100%;
+    mask-size: 100% 100%;
+  }
+}
+
 @keyframes cs2Skeleton {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 0.8; }

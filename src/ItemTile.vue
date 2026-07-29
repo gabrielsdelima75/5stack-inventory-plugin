@@ -11,7 +11,7 @@ import { computed, inject } from "vue";
 import { Check, Clock, Loader2, RefreshCw } from "lucide-vue-next";
 import type { InventoryItem } from "./api";
 import ItemArt from "./ItemArt.vue";
-import { attachmentsOf, CARD_ART, glowStyle, isReadOnly, STEAM_BLUE, weaponName } from "./itemVisuals";
+import { ART_FADE_B, attachmentsOf, CARD_ART, glowStyle, isAgentArt, isReadOnly, STEAM_BLUE, weaponName } from "./itemVisuals";
 import TeamDots from "./TeamDots.vue";
 import ItemName from "./ItemName.vue";
 import TileActions from "./TileActions.vue";
@@ -167,7 +167,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
     <!-- Same information, one line: thumb · (model) name + wear · state dots. -->
     <template v-if="row">
       <div class="relative z-[2] grid h-11 w-14 flex-none place-items-center rounded bg-background/40">
-        <ItemArt :inst="inst" :image="inst.item?.image" class="max-h-full max-w-full object-contain" />
+        <ItemArt :inst="inst" :image="inst.item?.image" class="max-h-full max-w-full object-contain" :class="isAgentArt(inst) && ART_FADE_B" />
       </div>
       <div class="relative z-[2] min-w-0 flex-1">
         <div v-if="showHeader" class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
@@ -175,9 +175,27 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
         </div>
         <div class="flex items-center gap-1.5">
           <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
-          <span v-if="inst.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
-          <span v-if="attachments.length" class="flex flex-none items-center gap-0.5">
-            <img v-for="(a, k) in attachments.slice(0, 4)" :key="k" :src="a.image ?? undefined" :title="a.name" alt="" class="h-3.5 w-3.5 object-contain" />
+          <!-- ST™ and the chips are ONE centred group. Apart, each aligned
+               itself against a row whose height is set by the tallest chip, so
+               the badge floated relative to them — and the taller charm chip
+               below makes any such gap worse. -->
+          <span v-if="inst.stattrak || attachments.length" class="flex flex-none items-center gap-1.5">
+            <span v-if="inst.stattrak" class="font-mono text-f8 leading-none text-[#f2c14e]">ST™</span>
+            <!-- The charm is drawn LARGER and last, behind a hairline: there is
+                 only ever one, it is picked on its own, and at sticker size in a
+                 row of four it read as a fifth sticker. -->
+            <span v-if="attachments.length" class="flex items-center gap-0.5">
+              <img
+                v-for="(a, k) in attachments.slice(0, 4)"
+                :key="k"
+                :src="a.image ?? undefined"
+                :title="a.name"
+                alt=""
+                :class="a.kind === 'charm'
+                  ? 'ml-0.5 h-5 w-5 flex-none border-l border-border/60 pl-1 object-contain'
+                  : 'h-3.5 w-3.5 flex-none object-contain'"
+              />
+            </span>
           </span>
         </div>
         <!-- Inline, not stacked: the stacked variant spends a second line on
@@ -225,14 +243,37 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
     </span>
 
     <div :class="CARD_ART">
-      <ItemArt :inst="inst" :image="inst.item?.image" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105" />
+      <ItemArt
+        :inst="inst"
+        :image="inst.item?.image"
+        class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
+        :class="isAgentArt(inst) && ART_FADE_B"
+      />
     </div>
 
-    <div class="relative z-[2] flex items-start gap-1.5">
-      <ItemName :item="inst.item" :strip="stripWeaponName" class="flex-1" />
-      <span v-if="inst.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
-      <span v-if="attachments.length" class="ml-auto flex flex-none items-center gap-0.5">
-        <img v-for="(a, k) in attachments.slice(0, 6)" :key="k" :src="a.image ?? undefined" :title="a.name" alt="" class="h-4 w-4 object-contain" />
+    <!-- items-CENTER, not items-start. The badge cluster is taller than a line
+         of text now that the charm chip is, so top-alignment left the name
+         sitting a few pixels above everything beside it. Centring is right in
+         both cases: against a plain name it is exact, and against a name with a
+         phase line above it (Doppler) the cluster centres on the pair. -->
+    <div class="relative z-[2] flex items-center gap-1.5">
+      <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
+      <!-- ST™ and the chips are ONE centred group: apart, the badge floated
+           against a row whose height is set by the tallest chip. -->
+      <span v-if="inst.stattrak || attachments.length" class="ml-auto flex flex-none items-center gap-1.5">
+        <span v-if="inst.stattrak" class="font-mono text-f8 leading-none text-[#f2c14e]">ST™</span>
+        <span v-if="attachments.length" class="flex items-center gap-0.5">
+          <img
+            v-for="(a, k) in attachments.slice(0, 6)"
+            :key="k"
+            :src="a.image ?? undefined"
+            :title="a.name"
+            alt=""
+            :class="a.kind === 'charm'
+              ? 'ml-0.5 h-6 w-6 flex-none border-l border-border/60 pl-1 object-contain'
+              : 'h-4 w-4 flex-none object-contain'"
+          />
+        </span>
       </span>
     </div>
 

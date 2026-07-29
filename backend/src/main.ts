@@ -2494,7 +2494,7 @@ async function extractVersionInfo() {
     hasExtractedModels(),
     readCurrentGameVersion(),
   ]);
-  const { version: extractVersion, gameBuild, gamePatch, gameDate, durationSeconds, steps } = stamp;
+  const { version: extractVersion, gameBuild, gamePatch, gameDate, durationSeconds, steps, extractedAt } = stamp;
   return {
     extractVersion,
     requiredVersion,
@@ -2503,6 +2503,12 @@ async function extractVersionInfo() {
     // "press this button" comes with an idea of what you're committing to.
     lastRunSeconds: durationSeconds,
     lastRunSteps: steps,
+    // When it finished, per the script's own stamp. The state file's
+    // `finishedAt` only exists if THIS process was still around to see the
+    // child exit — a pod restart or a `node --watch` reload mid-run reparents
+    // the script, which finishes and stamps itself while nobody writes the
+    // state file. That read as "never · 7m 27s": no date, but a duration.
+    lastRunAt: extractedAt,
     // CS2 build the assets were extracted against vs. what the install reports
     // now. `gameUpdated` is a soft, informational signal — it deliberately does
     // NOT feed `stale`/the re-extract badge, since most CS2 patches don't touch

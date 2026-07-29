@@ -55,16 +55,33 @@ export const CARD_ART =
 // the art at small sizes the moment the footer grew.
 export const CARD_CHROME_PX = 78;
 
+// Bottom feather for waist-cropped art — see `.art-fade-b` in style.css for
+// what it does and why it's per-item. Agents are the only type that needs it;
+// everything else is a whole object with air under it.
+export const ART_FADE_B = "art-fade-b";
+export const isAgentArt = (i?: { slot?: string | null; item?: { type?: string | null } | null } | null) =>
+  i?.item?.type === "agent" || i?.slot === "agent";
+
 export function glowStyle(color?: string | null, opacity = 0.42) {
   return color
     ? { background: `radial-gradient(75% 65% at 50% 42%, ${color}, transparent 62%)`, filter: "blur(16px)", opacity }
     : { opacity: 0 };
 }
 
+/** Every attachment on an item, tagged with WHAT it is.
+ *
+ *  The kind used to be flattened away, which left a tile rendering the charm as
+ *  a fifth sticker at sticker size — and a charm is one per weapon, chosen
+ *  separately, so it deserves to read as its own thing rather than get lost in
+ *  the row. Callers that only want images can still ignore it. */
 export function attachmentsOf(i: InventoryItem) {
-  return [...(i.stickers ?? []), ...(i.patches ?? []), ...(i.charm ? [i.charm] : [])].filter(
-    (x): x is NonNullable<typeof x> => !!x,
-  );
+  const tag = <T,>(list: (T | null | undefined)[], kind: "sticker" | "patch" | "charm") =>
+    list.filter((x): x is NonNullable<T> => !!x).map((x) => ({ ...x, kind }));
+  return [
+    ...tag(i.stickers ?? [], "sticker"),
+    ...tag(i.patches ?? [], "patch"),
+    ...tag(i.charm ? [i.charm] : [], "charm"),
+  ];
 }
 
 // "★ Butterfly Knife | Marble Fade" -> "Butterfly Knife". The catalog `model`
