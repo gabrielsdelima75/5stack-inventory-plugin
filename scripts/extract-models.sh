@@ -53,7 +53,57 @@ set -euo pipefail
 # written — the rewrite emitted a correct reference to a file that did not
 # exist, and those skins rendered broken (Deagle | Blaze). Any mount built
 # before this is missing every template vmat, which is why this bumps.
-EXTRACT_VERSION=8
+# v9 (2026-07-28): model textures are re-encoded to LOSSLESS webp and each .glb
+# is rewritten to reference them (step 3a2). Byte-identical pixels, measured
+# 18-36% smaller (avg ~25%) — an AK's colour map goes 15MB -> 10MB. A mount
+# built before this still serves PNG and still works; it just ships ~25% more
+# bytes on every first view of a weapon, which is why this bumps rather than
+# being left to the next unrelated re-extraction.
+# v10 (2026-07-28): v9's webp conversion silently produced PNG. ImageMagick
+# takes the output format from the extension, and both converters write to
+# "<name>.webp.tmp" first — ".tmp" is unrecognised, so it fell back to the input
+# format and the rename dressed a PNG up as a .webp. Fixed with an explicit
+# "webp:" prefix in BOTH places, which also fixes it for the PAINT textures,
+# where it has been happening since those were introduced (v6) and is why
+# /paints/textures is 3.4GB. Paint textures now encode LOSSLESS rather than the
+# `-quality 90` that line asked for and never performed — see the note there;
+# switching them to lossy now would change the pixels of all 2106 finishes.
+# Measured: model textures -30%, paint textures -25%, no pixel changed.
+# v12 (2026-07-28): two additions that sticker placement needs, both read from
+# assets we already had and neither previously recovered.
+#   - sticker-markup.json gains each slot's `region`: the authored placement
+#     area, as triangle soup in offset space, from the vmdl's StickerMarkup
+#     Polygons (which the parser used to skip). It is the only ground truth for
+#     where a sticker may sit — cs2-lib's per-weapon bounds are a rectangle
+#     drawn around it that overshoots by a third of the weapon on the M4A1-S, so
+#     a drag clamped to the box named a UV that is nowhere on the unwrap and the
+#     sticker silently stopped moving.
+#   - sticker/patch materials are now entry points, and the walk takes exactly
+#     ONE texture from them (`g_tSticker0`) before stopping — ~3.2k textures, not
+#     the 6,245 their full chain drags in (see v7). That texture is what the game
+#     draws; the icon we drew instead is 512x384 with the art inset and pushed to
+#     one edge, so every sticker was squashed and hung above its own anchor.
+# A mount built before this still works: the viewer falls back to the bounds box
+# and to cropping the icon.
+# v13 (2026-07-28): textures are encoded with `cwebp -exact`, not ImageMagick.
+# IM's WebP writer ZEROES the RGB of fully-transparent texels. For a picture
+# that is invisible; for these it is destruction, because the compositor samples
+# colour channels independently of alpha and case hardening reads pattern.g as a
+# ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
+# instead of dark steel, and anything with an SFX/material mask over-shiny.
+# Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v15 (2026-07-29): the KV3 parser now understands binary blobs (`#[ 07 00 ... ]`).
+# Every charm material carries one, so all 23 failed to parse in v14 with
+# "cannot tokenize at '#['" and not one was written — the community charms had
+# their model resolved and no material to dress it with. Re-run needed for them.
+# v14 (2026-07-29): charm-models.json (step 3e) — which MODEL and which MATERIAL
+# each charm is, parsed from the econ schema's keychain_definitions. A charm is
+# not one model per charm: 23 of the 82 on this build are a shared blank mesh
+# (workshop_blanks/kc_missinglink_default) wearing their own keychain_material,
+# so resolving the model from the item's image name found nothing for them and
+# they rendered as flat art. The named materials ride the paint chain, so their
+# textures land alongside every other one.
+EXTRACT_VERSION=15
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -147,7 +197,12 @@ fmt_dur() { # seconds -> "1m 23s" / "45s"
 PROGRESS_FILE="${OUT_DIR:-$WORK}/extract-progress.json"
 export PROGRESS_FILE
 # Declared here so the panel can show what is coming, not just what has been.
-STEPS=(decompile-models rename-models composite-inputs charm-anchors sticker-markup econ-icons paint-chain stamp)
+# ORDER MATTERS: this is the list the panel renders, and a step missing from it
+# does not appear at all — it runs invisibly and the bar simply sits on the
+# previous step, which reads as a hang. (model-textures was added in v9 and did
+# exactly that for one run: several minutes of texture compression with the UI
+# still showing "Mapping models to catalog keys" as the last thing that moved.)
+STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models econ-icons paint-chain sticker-art stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -164,6 +219,14 @@ name = os.environ["P_NAME"]
 for s in d.get("steps", []):
     if s["name"] == name:
         s["state"] = os.environ["P_STATE"]
+        # Wall-clock start, so the panel can count a RUNNING step up. Finished
+        # steps report `seconds`; without this the current one showed only a
+        # unit count, and the longest step in the run (texture compression) had
+        # no way to say how long it had been at it. Set once — the embedded
+        # python steps re-assert state="running" on every progress update, and
+        # resetting here would restart the clock a few times a second.
+        if os.environ["P_STATE"] == "running" and not s.get("started"):
+            s["started"] = int(__import__("time").time())
         for key, env in (("done", "P_DONE"), ("total", "P_TOTAL"), ("seconds", "P_SECS")):
             v = os.environ.get(env, "")
             if v:
@@ -273,7 +336,15 @@ echo "--- Decompiling weapon models (this takes a few minutes)…"
 # racing to write the same shared material/texture files, and a torn texture is
 # not something the later flat-copy would notice. They are merged with `cp -rn`
 # afterwards, first writer wins — the files are identical either way.
-mapfile -t WEAPON_DIRS < <(grep '^weapons/models/.*\.vmdl_c$' "$VPK_LIST" |
+# Keychains ride along with the weapons: they are ordinary models under a
+# sibling tree (weapons/keychains/<collection>/[vmdl/]kc_*.vmdl_c), one per
+# charm, ~43KB each and 62 of them. Same decompile, same texture handling, so
+# adding the tree here is the whole cost — no second pass, and the shard
+# scheduler picks them up as a few more dirs.
+#
+# Taking the first three path components covers both layouts the collections
+# use (with and without the extra vmdl/ level).
+mapfile -t WEAPON_DIRS < <(grep -E '^weapons/(models|keychains)/.*\.vmdl_c$' "$VPK_LIST" |
   awk -F/ 'NF>3 {print $1"/"$2"/"$3"/"}' | sort -u)
 SHARDS="$WORK/raw_shards"
 rm -rf "$SHARDS"
@@ -411,12 +482,27 @@ declare -A MAP=(
 )
 
 count=0
+charms=0
 while IFS= read -r -d '' f; do
   base="$(basename "$f" .glb)"
   key="${MAP[$base]:-}"
   if [[ -n "$key" ]]; then
     cp "$f" "$DEST/$key.glb"
     count=$((count + 1))
+  elif [[ "$base" == kc_*_physics ]]; then
+    # Collision hulls ship alongside every charm and render as a grey blob if
+    # anything ever loaded one. Nothing looks them up, so drop them rather than
+    # doubling the charm count on the mount.
+    :
+  elif [[ "$base" == kc_* ]]; then
+    # Charms, TOP LEVEL on purpose. The exporter writes textures as separate
+    # files referenced by RELATIVE uri, and the flat copy below drops them all
+    # in $DEST — so a charm parked in a subdirectory would look for its textures
+    # one level down and render untextured. The kc_ prefix already namespaces
+    # them against the weapon keys, and it is exactly the stem the catalog's
+    # image gives (kc_missinglink_ava_36bc006a.webp -> kc_missinglink_ava).
+    cp "$f" "$DEST/$base.glb"
+    charms=$((charms + 1))
   elif [[ "$base" == *knife* || "$base" == *bayonet* || "$base" == *karambit* || "$base" == *daggers* ]]; then
     # Mapped knives now land top-level via MAP; what still falls here is the
     # _physics collision hulls and stattrak_module_knife — none of them render.
@@ -432,7 +518,228 @@ done < <(find "$RAW" -name '*.glb' -print0)
 # copy dedupes shared ones (default_*, sticker_gaps, ...).
 find "$RAW" -name '*.png' -exec cp -n {} "$DEST" \; 2>/dev/null || true
 
-echo "--- Mapped $count weapons ($(du -sh "$DEST" | cut -f1) total)"
+echo "--- Mapped $count weapons, $charms charms ($(du -sh "$DEST" | cut -f1) total)"
+
+# ---- 3a2. Model textures -> lossless webp -------------------------------------
+step "model-textures"
+# The glTF exporter writes PNG. Lossless WebP is byte-identical after decode and
+# MEASURED 18-36% smaller on these (avg ~25%: ak47_default_color 15->10MB,
+# _normal 15->11MB, _ao/orm 17->14MB) — so this is pure transfer and disk saved
+# with no pixel changed. LOSSLESS is not optional: these are normal maps and
+# packed ORM/mask data, where lossy WebP's chroma subsampling would smear
+# channels that are independent signals rather than colour.
+#
+# The .glb references its textures by relative URI, so the JSON chunk has to be
+# rewritten to match — done here rather than at load time because the viewer
+# would otherwise have to probe for a .webp twin on every texture.
+DEST="$DEST" python3 - <<'PYEOF'
+import json, os, shutil, struct, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+dest = os.environ["DEST"]
+# cwebp, NOT ImageMagick. IM's WebP writer zeroes the RGB of fully-transparent
+# pixels, and these textures are DATA — the compositor samples colour channels
+# independently of alpha. Silently correct-looking, catastrophically wrong.
+# There is no ImageMagick fallback for the same reason; without cwebp the PNGs
+# are simply left alone, which costs transfer but never pixels.
+have_cwebp = shutil.which("cwebp") is not None
+if not have_cwebp:
+    print("!!  `cwebp` not found — leaving model textures as PNG (~30% larger "
+          "transfers). Install the `webp` package for the real output. NOT "
+          "falling back to ImageMagick: its WebP writer discards colour under "
+          "zero alpha, which corrupts masks and ramp-lookup patterns.",
+          file=sys.stderr)
+
+CORES = int(os.environ.get("CORES") or 0) or (os.cpu_count() or 4)
+def pool_size(cap=8):
+    try:
+        with open(os.environ["JOBS_FILE"]) as fh:
+            n = int(fh.read().strip())
+    except Exception:
+        n = int(os.environ.get("EXTRACT_JOBS") or 1)
+    return max(1, min(cap, CORES, max(4, n)))
+
+def progress(step, done, total, state="running", secs=None):
+    """Update this step's unit count in the shared progress file. Read-modify-
+    write because the file holds every step, not just the current one.
+
+    `state="done"` with `secs` closes a step the way the shell's `step` helper
+    does, for a program that spans more than one step."""
+    pf = os.environ.get("PROGRESS_FILE")
+    if not pf:
+        return
+    try:
+        try:
+            with open(pf) as fh:
+                doc = json.load(fh)
+        except Exception:
+            doc = {"steps": []}
+        for s in doc.get("steps", []):
+            if s["name"] == step:
+                s["state"] = state
+                s["done"], s["total"] = done, total
+                if secs is not None:
+                    s["secs"] = secs
+                break
+        else:
+            # The step id must exist in the shell's STEPS list or the update
+            # lands nowhere and the row sits indeterminate forever.
+            print(f"!! progress: no step named {step!r} — check STEPS in the shell",
+                  file=sys.stderr)
+        with open(pf, "w") as fh:
+            json.dump(doc, fh)
+    except Exception:
+        pass
+
+# Every .glb we placed, wherever it landed.
+glbs = []
+for root, _dirs, files in os.walk(dest):
+    for f in files:
+        if f.endswith(".glb"):
+            glbs.append(os.path.join(root, f))
+
+def read_glb(path):
+    """(header_version, json_dict, bin_chunk_bytes) or None."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) < 20 or data[:4] != b"glTF":
+        return None
+    ver = struct.unpack_from("<I", data, 4)[0]
+    off, doc, binc = 12, None, b""
+    while off + 8 <= len(data):
+        clen, ctype = struct.unpack_from("<II", data, off)
+        chunk = data[off + 8: off + 8 + clen]
+        if ctype == 0x4E4F534A:
+            doc = json.loads(chunk.decode("utf-8"))
+        elif ctype == 0x004E4942:
+            binc = chunk
+        off += 8 + clen
+    return None if doc is None else (ver, doc, binc)
+
+def write_glb(path, ver, doc, binc):
+    """Rebuild the container. Chunk payloads are 4-byte aligned by spec — JSON
+    pads with spaces, BIN with zeros — and every length in the header has to
+    agree or the loader rejects the file outright."""
+    js = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    js += b" " * (-len(js) % 4)
+    out = bytearray()
+    out += b"glTF" + struct.pack("<I", ver) + struct.pack("<I", 0)  # length patched below
+    out += struct.pack("<II", len(js), 0x4E4F534A) + js
+    if binc:
+        pad = binc + b"\x00" * (-len(binc) % 4)
+        out += struct.pack("<II", len(pad), 0x004E4942) + pad
+    struct.pack_into("<I", out, 8, len(out))
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(bytes(out))
+    os.replace(tmp, path)
+
+# Collect every PNG the models actually reference. Anything unreferenced is left
+# alone — converting it would spend minutes on bytes nothing fetches.
+parsed = {}
+wanted = set()
+for g in glbs:
+    got = read_glb(g)
+    if not got:
+        continue
+    parsed[g] = got
+    for img in got[1].get("images", []) or []:
+        uri = img.get("uri")
+        if uri and uri.lower().endswith(".png"):
+            wanted.add(uri)
+
+# Same trap the paint staging hits: skipping what already exists is the right
+# resume behaviour right up until the ENCODING changes, at which point every
+# existing file is the thing being fixed. v9 wrote PNGs under .webp names, so a
+# v10 run that trusted them would ship the bug it was released to fix. The stamp
+# still holds the PREVIOUS run's version here — it is written at the very end.
+TEXTURE_ENCODING_VERSION = 13
+try:
+    with open(os.path.join(dest, "extract-version.json")) as fh:
+        _prev = int(json.load(fh).get("version") or 0)
+except Exception:
+    _prev = 0
+reencode = _prev < TEXTURE_ENCODING_VERSION
+if reencode and _prev:
+    print(f"---   texture encoding changed (mount v{_prev} < v{TEXTURE_ENCODING_VERSION}) — re-encoding all",
+          flush=True)
+
+def convert(uri):
+    src = os.path.join(dest, uri)
+    dst = os.path.join(dest, uri[:-4] + ".webp")
+    if os.path.exists(dst) and not reencode:
+        return uri  # already done by an earlier run
+    if not os.path.exists(src):
+        return None
+    tmp = dst + ".tmp"
+    try:
+        if not have_cwebp:
+            return None
+        # -exact is the whole point: without it libwebp is free to rewrite the
+        # RGB of fully-transparent texels to zero, because for a PICTURE they are
+        # invisible. These are not pictures. Verified byte-identical RGBA with
+        # it, and 192 bytes different without it on a 64x64 probe.
+        subprocess.run(
+            ["cwebp", "-exact", "-lossless", "-q", "100", src, "-o", tmp],
+            check=True, capture_output=True,
+        )
+        os.replace(tmp, dst)
+        return uri
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+todo = sorted(wanted)
+progress("model-textures", 0, len(todo))
+done = set()
+if have_cwebp and todo:
+    with ThreadPoolExecutor(max_workers=pool_size()) as pool:
+        for i, res in enumerate(pool.map(convert, todo), 1):
+            if res:
+                done.add(res)
+            if i % 10 == 0 or i == len(todo):
+                progress("model-textures", i, len(todo))
+            # The run log is the other place people watch, and this is the
+            # longest step in the extraction — silence here reads as a hang just
+            # as much as a missing progress row does.
+            if i % 50 == 0 or i == len(todo):
+                print(f"---   textures {i}/{len(todo)}", flush=True)
+
+# Repoint the models at what actually converted. A texture that failed keeps its
+# PNG and its URI, so a partial pass degrades to "some are still PNG" rather
+# than to a model referencing a file that was never written.
+rewritten = 0
+for g, (ver, doc, binc) in parsed.items():
+    changed = False
+    for img in doc.get("images", []) or []:
+        uri = img.get("uri")
+        if uri in done:
+            img["uri"] = uri[:-4] + ".webp"
+            if img.get("mimeType"):
+                img["mimeType"] = "image/webp"
+            changed = True
+    if changed:
+        write_glb(g, ver, doc, binc)
+        rewritten += 1
+
+# Only now are the PNGs safe to drop: every .glb that named one points at the
+# .webp. Done last so an interrupted run leaves both forms on disk (harmless)
+# rather than a model pointing at a file that is gone (fatal).
+freed = 0
+if rewritten:
+    for uri in done:
+        p = os.path.join(dest, uri)
+        try:
+            freed += os.path.getsize(p)
+            os.remove(p)
+        except OSError:
+            pass
+print(f"---   {len(done)}/{len(todo)} textures -> lossless webp, "
+      f"{rewritten} glb rewritten, {freed / 1e6:.0f}MB freed", flush=True)
+PYEOF
 
 # ---- 3b. Per-weapon composite inputs ------------------------------------------
 step "composite-inputs"
@@ -635,9 +942,13 @@ unmapped, unscannable, missing_tex = [], [], []
 
 # Unit-level progress for the panel. Written to the same file the shell uses —
 # see the `progress` helper there for why it is a file and not stdout.
-def progress(step, done, total):
+
+def progress(step, done, total, state="running", secs=None):
     """Update this step's unit count in the shared progress file. Read-modify-
-    write because the file holds every step, not just the current one."""
+    write because the file holds every step, not just the current one.
+
+    `state="done"` with `secs` closes a step the way the shell's `step` helper
+    does, for a program that spans more than one step."""
     pf = os.environ.get("PROGRESS_FILE")
     if not pf:
         return
@@ -649,8 +960,10 @@ def progress(step, done, total):
             doc = {"steps": []}
         for s in doc.get("steps", []):
             if s["name"] == step:
-                s["state"] = "running"
+                s["state"] = state
                 s["done"], s["total"] = done, total
+                if secs is not None:
+                    s["secs"] = secs
                 break
         else:
             # The step id must exist in the shell's STEPS list or the update
@@ -1149,10 +1462,20 @@ def value(raw):
     except ValueError:
         return raw
 
+NUMBER = re.compile(r"^-?\d")
+
 def parse_markup(lines):
-    """The array of slot records under `StickerMarkup`. Indentation-driven: each
-    record also carries a Polygons/Vertices tree we want nothing from, and
-    keying on depth skips it without having to parse KV3 in general."""
+    """The array of slot records under `StickerMarkup`. Indentation-driven, which
+    is what lets it read the nested Polygons tree without parsing KV3 in general.
+
+    Each record carries `Polygons`: a list of objects whose `Vertices` are flat
+    triangle soup in the SAME space as `Offset` (uv1 recentred on 0). That is the
+    authored region the slot may be placed on, and it is the only ground truth
+    for where a sticker is allowed to sit — cs2-lib's per-weapon bounds box is a
+    rectangle around it that overshoots badly (measured on the M4A1-S: the box
+    runs to u +1.007 where the real region ends at +0.467), so a drag clamped to
+    the box lands on a UV that is not on the unwrap at all and the sticker
+    silently stops moving."""
     try:
         i = next(n for n, l in enumerate(lines) if l.strip() == "StickerMarkup =")
     except StopIteration:
@@ -1164,6 +1487,9 @@ def parse_markup(lines):
         return []
     base = len(lines[j]) - len(lines[j].lstrip("\t"))
     out, entry = [], None
+    # Bracket depth inside a Polygons block: its own "[" takes it to 1 and the
+    # matching "]" back to 0, which is what ends the block.
+    in_poly, poly_depth = False, 0
     for line in lines[j + 1:]:
         # VRF separates array elements with a trailing comma ("\t\t},"), so the
         # record terminators are `},` and not `}`. Dropping it here rather than
@@ -1172,6 +1498,16 @@ def parse_markup(lines):
         # and the whole pass silently yields zero slots.
         stripped = line.strip().rstrip(",")
         indent = len(line) - len(line.lstrip("\t"))
+        if in_poly:
+            closes = stripped.count("]")
+            poly_depth += stripped.count("[") - closes
+            if closes and poly_depth <= 0:
+                in_poly, poly_depth = False, 0
+            elif entry is not None and NUMBER.match(stripped):
+                entry.setdefault("_verts", []).extend(
+                    float(x) for x in stripped.split(",") if x.strip()
+                )
+            continue
         if indent <= base and stripped == "]":
             break
         if indent == base + 1:
@@ -1181,8 +1517,10 @@ def parse_markup(lines):
                 out.append(entry)
                 entry = None
             continue
-        # Anything deeper than a record's own keys is the polygon mesh.
         if entry is None or indent != base + 2:
+            continue
+        if stripped == "Polygons =":
+            in_poly, poly_depth = True, 0  # the "[" on the next line opens it
             continue
         m = SCALAR.match(stripped)
         if m:
@@ -1207,6 +1545,12 @@ def slot(rec):
     special = rec.get("SpecialIdentifier")
     if special:
         out["special"] = str(special)
+    # The authored region, as flat triangle soup (x,y per vertex, 3 vertices per
+    # triangle) in the same space as Offset. Dropped when it isn't whole
+    # triangles — a partial region would silently shrink where a sticker may go.
+    verts = rec.get("_verts")
+    if isinstance(verts, list) and len(verts) >= 6 and len(verts) % 6 == 0:
+        out["region"] = [round(float(v), 5) for v in verts]
     return out
 
 markup, empty = {}, []
@@ -1233,6 +1577,110 @@ if empty:
 if not markup:
     print("!!! No sticker markup recovered at all — sticker placement will fall "
           "back to the silhouette guess. Check the `-b DATA` output format.")
+PYEOF
+
+# ---- 3e. Charm model + material map ------------------------------------------
+step "charm-models"
+# Which MODEL and which MATERIAL each charm is, straight from the econ schema.
+#
+# A charm is not "one model per charm". The community collections are a shared
+# blank mesh wearing their own material — measured on this build, 23 of the 82
+# charms with a model all point at
+# weapons/keychains/workshop_blanks/kc_missinglink_default.vmdl and differ only
+# by `keychain_material`. Guessing the model from the item's image name (which
+# is what the viewer did first) therefore works for the 59 that happen to own a
+# model of the same name and silently fails for the rest — they rendered as flat
+# art with no way to tell why.
+#
+# scripts/items/items_game.txt carries the real answer per keychain index:
+#   "55" { name kc_missinglink_slime
+#          pedestal_display_model weapons/keychains/workshop_blanks/kc_missinglink_default.vmdl
+#          keychain_material      weapons/keychains/missinglink_community_01/kc_missinglink_slime.vmat }
+#
+# The definitions arrive in SEVERAL `keychain_definitions` blocks (one per
+# release), so they are merged rather than read from the first.
+echo ""
+echo "--- Reading charm models…"
+rm -rf "$WORK/raw_items"
+"$CLI" -i "$VPK" -o "$WORK/raw_items" -d -f "scripts/items/items_game.txt" >/dev/null 2>&1 || true
+ITEMS_GAME="$(find "$WORK/raw_items" -name items_game.txt | head -1)"
+ITEMS_GAME="$ITEMS_GAME" DEST="$DEST" CHARM_MATS="$WORK/charm-materials.json" python3 - <<'PYEOF'
+import hashlib, json, os, re
+
+src, dest = os.environ.get("ITEMS_GAME", ""), os.environ["DEST"]
+KV = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"\s*$')
+INDEX = re.compile(r'^"(\d+)"$')
+
+
+def parse(path):
+    """Every `keychain_definitions` block, merged by index."""
+    out = {}
+    lines = open(path, encoding="utf8", errors="replace").read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != '"keychain_definitions"':
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != "{":
+            j += 1
+        depth, j = 1, j + 1
+        cur, entry = None, None
+        while j < len(lines) and depth > 0:
+            stripped = lines[j].strip()
+            if stripped == "{":
+                depth += 1
+            elif stripped == "}":
+                depth -= 1
+                if depth == 1 and cur is not None:
+                    out[cur] = entry
+                    cur, entry = None, None
+            elif depth == 1:
+                m = INDEX.match(stripped)
+                if m:
+                    cur, entry = m.group(1), {}
+            elif depth == 2 and entry is not None:
+                m = KV.match(lines[j])
+                if m:
+                    entry[m.group(1)] = m.group(2)
+            j += 1
+        i = j
+    return out
+
+
+# Same naming the paint chain uses for anything cs2-lib does not name, so the
+# material this points at is the file that step writes.
+def mat_out_name(path):
+    stem = os.path.basename(path)
+    stem = stem[: stem.index(".")]
+    return f"{stem}_{hashlib.sha1((path + '_c').encode()).hexdigest()[:8]}.vmat.json"
+
+
+charms, mats = {}, []
+if src and os.path.exists(src):
+    for index, rec in sorted(parse(src).items(), key=lambda kv: int(kv[0])):
+        name = rec.get("name")
+        model = rec.get("pedestal_display_model")
+        if not name or not model:
+            continue  # sticker slabs and the like carry no display model
+        entry = {"index": int(index), "model": os.path.basename(model).replace(".vmdl", "")}
+        mat = rec.get("keychain_material")
+        if mat:
+            entry["material"] = f"/materials/{mat_out_name(mat)}"
+            mats.append(mat + "_c")
+        charms[name] = entry
+
+with open(os.path.join(dest, "charm-models.json"), "w") as fh:
+    json.dump(charms, fh, indent=1, sort_keys=True)
+# Handed to the paint chain, which owns extracting materials and their textures.
+with open(os.environ["CHARM_MATS"], "w") as fh:
+    json.dump(sorted(set(mats)), fh)
+
+shared = len([c for c in charms.values() if "material" in c])
+print(f"--- Charm models: {len(charms)} charms, {shared} sharing a blank mesh with their own material")
+if not charms:
+    print("!!! No charm definitions recovered — charms will fall back to their "
+          "flat art. Check that scripts/items/items_game.txt extracted.")
 PYEOF
 
 # ---- 4. Econ item icons ------------------------------------------------------
@@ -1278,17 +1726,29 @@ rm -rf "$PAINT_DEST"
 # PATH, not the contents — so if Valve changes a texture's bytes without moving
 # it, the name is identical, the resume check sees the file and we would serve
 # the old one forever. A build change therefore forces a clean rebuild.
-PREV_BUILD=$(STAMP="$DEST/extract-version.json" python3 - <<'PYV' 2>/dev/null || true
+#
+# The SAME hazard applies to a change in THIS script's encoding of a texture,
+# which is not a CS2 build change at all. v10 fixed the webp conversion that had
+# been writing PNGs under .webp names since v6; seeding from live would have
+# hardlinked all 2,647 of those in and the skip-what-exists resume would have
+# left every one of them untouched, so the fix would have shipped as a no-op.
+# Any stamp older than the version that last changed texture ENCODING has to
+# rebuild from scratch.
+PAINT_ENCODING_VERSION=13
+read -r PREV_BUILD PREV_VERSION <<<"$(STAMP="$DEST/extract-version.json" python3 - <<'PYV' 2>/dev/null || echo " "
 import json, os
 try:
-    print(json.load(open(os.environ["STAMP"])).get("gameBuild") or "")
+    d = json.load(open(os.environ["STAMP"]))
+    print(d.get("gameBuild") or "-", d.get("version") or 0)
 except Exception:
-    print("")
+    print("-", 0)
 PYV
-)
-if [[ -n "$GAME_BUILD" && "$PREV_BUILD" == "$GAME_BUILD" ]]; then
+)"
+if [[ -n "$GAME_BUILD" && "$PREV_BUILD" == "$GAME_BUILD" && "${PREV_VERSION:-0}" -ge "$PAINT_ENCODING_VERSION" ]]; then
   echo "--- Seeding paint staging from the live copy (same CS2 build $GAME_BUILD)"
   cp -al "$PAINT_LIVE" "$PAINT_DEST"
+elif [[ "${PREV_VERSION:-0}" -lt "$PAINT_ENCODING_VERSION" ]]; then
+  echo "--- Paint texture encoding changed (mount v${PREV_VERSION:-0} < v$PAINT_ENCODING_VERSION) — rebuilding paints from scratch"
 else
   echo "--- CS2 build changed (${PREV_BUILD:-none} -> ${GAME_BUILD:-unknown}) — rebuilding paints from scratch"
 fi
@@ -1446,9 +1906,13 @@ if not have_convert:
 
 # Unit-level progress for the panel. Written to the same file the shell uses —
 # see the `progress` helper there for why it is a file and not stdout.
-def progress(step, done, total):
+
+def progress(step, done, total, state="running", secs=None):
     """Update this step's unit count in the shared progress file. Read-modify-
-    write because the file holds every step, not just the current one."""
+    write because the file holds every step, not just the current one.
+
+    `state="done"` with `secs` closes a step the way the shell's `step` helper
+    does, for a program that spans more than one step."""
     pf = os.environ.get("PROGRESS_FILE")
     if not pf:
         return
@@ -1460,8 +1924,10 @@ def progress(step, done, total):
             doc = {"steps": []}
         for s in doc.get("steps", []):
             if s["name"] == step:
-                s["state"] = "running"
+                s["state"] = state
                 s["done"], s["total"] = done, total
+                if secs is not None:
+                    s["secs"] = secs
                 break
         else:
             # The step id must exist in the shell's STEPS list or the update
@@ -1581,14 +2047,29 @@ PYEOF
   RAW_PAINTS="$WORK/raw_paints"
   rm -rf "$RAW_PAINTS"
   CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_PAINTS="$RAW_PAINTS" \
+  CHARM_MATS="$WORK/charm-materials.json" \
   ASSET_MANIFEST="$ASSET_MANIFEST" PAINT_DEST="$PAINT_DEST" python3 - <<'PYEOF'
-import glob, hashlib, json, os, re, shutil, subprocess
+import glob, hashlib, json, os, re, shutil, subprocess, time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+STARTED = time.time()
 cli, vpk = os.environ["CLI"], os.environ["VPK"]
 raw, dest = os.environ["RAW_PAINTS"], os.environ["PAINT_DEST"]
 manifest = json.load(open(os.environ["ASSET_MANIFEST"])).get("paints", [])
+# Charm materials, handed over by the charm-models step (§3e). They are entry
+# points like any other, but they do not come from cs2-lib — a charm has no
+# paintMaterial, its material is named by the econ schema — so they arrive as
+# raw archive paths rather than manifest entries. 23 materials, ~4 textures
+# each: the whole reason the community charms can render at all, since their
+# model is a shared blank and the material is the entire difference between one
+# charm and the next.
+CHARM_MATS = []
+try:
+    with open(os.environ.get("CHARM_MATS") or "") as fh:
+        CHARM_MATS = [p for p in json.load(fh) if isinstance(p, str)]
+except Exception:
+    pass
 
 # ---- pool sizing ------------------------------------------------------------
 # Same worker count the panel writes and the decompile loop watches, re-read
@@ -1613,10 +2094,19 @@ def pool_size(cap=8):
 
 
 # Unit-level progress for the panel. Written to the same file the shell uses —
-# see the `progress` helper there for why it is a file and not stdout.
-def progress(step, done, total):
+# see the `progress` helper there for why it is a file and not stdout.#
+# This program covers TWO steps — the paint chain and the sticker art that
+# follows it — so it also has to CLOSE them, with their own elapsed times. The
+# shell's `step` helper can't: it sees one heredoc and would bill the whole run
+# to paint-chain, leaving sticker-art showing "running" forever and hiding how
+# long ~3.2k sticker textures actually take.
+
+def progress(step, done, total, state="running", secs=None):
     """Update this step's unit count in the shared progress file. Read-modify-
-    write because the file holds every step, not just the current one."""
+    write because the file holds every step, not just the current one.
+
+    `state="done"` with `secs` closes a step the way the shell's `step` helper
+    does, for a program that spans more than one step."""
     pf = os.environ.get("PROGRESS_FILE")
     if not pf:
         return
@@ -1628,8 +2118,10 @@ def progress(step, done, total):
             doc = {"steps": []}
         for s in doc.get("steps", []):
             if s["name"] == step:
-                s["state"] = "running"
+                s["state"] = state
                 s["done"], s["total"] = done, total
+                if secs is not None:
+                    s["secs"] = secs
                 break
         else:
             # The step id must exist in the shell's STEPS list or the update
@@ -1650,6 +2142,7 @@ _TOKEN = re.compile(
     r"""
       (?P<ws>\s+)
     | (?P<comment><!--.*?-->)
+    | (?P<blob>\#\[[^\]]*\])
     | (?P<punct>[\{\}\[\],=])
     | (?P<prefixed>[A-Za-z_][A-Za-z0-9_]*:"(?:[^"\\]|\\.)*")
     | (?P<string>"(?:[^"\\]|\\.)*")
@@ -1732,6 +2225,13 @@ def kv3_parse(text):
                     take()
                     continue
                 arr.append(value())
+        # KV3 binary blob: `#[ 07 00 00 ... ]`. Nothing here ever reads the
+        # bytes — they carry compiled shader state — but the tokenizer has to
+        # recognise them or the whole document fails. That is not hypothetical:
+        # every charm material has one, so all 23 of them errored out with
+        # "cannot tokenize at '#['" and no charm material was ever written.
+        if kind == "blob":
+            return None
         if kind == "string":
             return text_[1:-1]
         if kind == "prefixed":
@@ -1861,8 +2361,19 @@ def kv3_body(text):
 RESOURCE_SUFFIX = re.compile(r"\.(vcompmat|vmat|vtex)$")
 
 # ---- walk the graph from every entry point ---------------------------------
-docs, textures, failed = {}, set(), []
+# `sticker_textures` is a subset of `textures`, tracked so the two get their own
+# progress rows and their own times — a sticker run adds thousands of files and
+# billing that to the paint chain makes the paint chain look like it regressed.
+docs, textures, sticker_textures, failed = {}, set(), set(), []
+seen_charm = set()
 queue = [p for p in wanted_name if p.endswith(("vcompmat_c", "vmat_c"))]
+# Charm materials resolve by exact archive path, so they skip the by_key lookup
+# the manifest entries need. out_name() falls through to its hash naming for
+# them, which is what charm-models.json was written against.
+for p in CHARM_MATS:
+    if p not in seen_charm:
+        seen_charm.add(p)
+        queue.append(p)
 seen = set(queue)
 while queue:
     path = queue.pop()
@@ -1884,6 +2395,24 @@ while queue:
         failed.append(f"{path} ({e})")
         continue
     docs[path] = doc
+
+    # STICKERS STOP HERE. A sticker/patch material is an entry point like any
+    # other, but only one texture out of it is ever drawn: `g_tSticker0`, the
+    # square albedo the game puts on the weapon. Following the rest of its chain
+    # — holo spectrum, sfx masks, normals, the shared backing and scratches —
+    # would quadruple the texture count for assets the viewer never samples.
+    #
+    # Recognised by shader name rather than by the manifest flag so a material
+    # reached BY REFERENCE is treated the same way as one we asked for.
+    if str(doc.get("m_shaderName") or "") == "csgo_weapon_sticker.vfx":
+        for tp in doc.get("m_textureParams") or []:
+            if isinstance(tp, dict) and tp.get("m_name") == "g_tSticker0":
+                target = resolve_ref(str(tp.get("m_pValue") or ""))
+                if target and target.endswith("vtex_c"):
+                    textures.add(target)
+                    sticker_textures.add(target)
+                break
+        continue
 
     def visit(node):
         # Follow typed `resource:` refs AND plain strings that name a resource.
@@ -1970,10 +2499,17 @@ def convert(node):
 # textures still present, or the new one with textures already written. The
 # worst a reader sees is a material that hasn't been refreshed yet, which is a
 # correct older skin rather than a broken new one.
-have_convert = shutil.which("convert") is not None
+have_cwebp = shutil.which("cwebp") is not None
 tex_dir = os.path.join(dest, "textures")
-todo = [t for t in sorted(textures) if not os.path.exists(os.path.join(tex_dir, out_name(t, "vtex")))]
-print(f"---   {len(todo)} textures to extract ({len(textures) - len(todo)} already present)")
+missing = [t for t in sorted(textures) if not os.path.exists(os.path.join(tex_dir, out_name(t, "vtex")))]
+# Two phases, two progress rows, two times: paint textures under "paint-chain"
+# and sticker art under "sticker-art". Sticker art is thousands of files on a
+# first run, and billing that to the paint chain makes an unchanged paint chain
+# look like it doubled.
+paint_todo = [t for t in missing if t not in sticker_textures]
+sticker_todo = [t for t in missing if t in sticker_textures]
+print(f"---   {len(paint_todo)} paint textures + {len(sticker_todo)} sticker textures to extract "
+      f"({len(textures) - len(missing)} already present)")
 
 # `-f` takes a COMMA-SEPARATED LIST and accepts exact file paths, so one process
 # can extract exactly the textures we want. The catch: it only honours exact
@@ -1986,10 +2522,20 @@ print(f"---   {len(todo)} textures to extract ({len(textures) - len(todo)} alrea
 # tracking to ~3 hours. Exact batches do neither.
 BATCH = 150
 converted = 0
-# See the econ-icons pass: publish the denominator before the first batch so
-# the panel has a determinate bar from the start.
-progress("paint-chain", 0, len(todo))
-for bi in range(0, len(todo), BATCH):
+
+
+def extract_textures(todo, step, close=False):
+  """Pull and convert one phase's textures, reporting under `step`.
+
+  `close` marks the step finished with its own elapsed time — the sticker phase
+  ends here, while the paint phase still has its materials to write."""
+  global converted
+  started = time.time()
+  converted = 0
+  # See the econ-icons pass: publish the denominator before the first batch so
+  # the panel has a determinate bar from the start.
+  progress(step, 0, len(todo))
+  for bi in range(0, len(todo), BATCH):
     batch = todo[bi:bi + BATCH]
     shutil.rmtree(raw, ignore_errors=True)
     os.makedirs(raw, exist_ok=True)
@@ -2027,10 +2573,46 @@ for bi in range(0, len(todo), BATCH):
         # catch a half-written image.
         tmp = dst + ".tmp"
         try:
-            if not have_convert:
+            if not have_cwebp:
+                # Copy the PNG bytes under the .webp name. Ugly, but it is what
+                # this line did for its whole life before v10 and it renders
+                # CORRECTLY — browsers sniff the content. Never fall back to
+                # ImageMagick's WebP writer: see below.
                 shutil.copyfile(src, tmp)
             else:
-                subprocess.run(["convert", src, "-quality", "90", tmp], check=True, capture_output=True)
+                # Three corrections to one line, all from 2026-07-28. The first
+                # two were found by inspection; the third by a skin going wrong
+                # in production, which is the only reason the others mattered.
+                #
+                # 1. Written via cwebp, not ImageMagick. IM's WebP writer ZEROES
+                #    the RGB of fully-transparent texels — fine for a picture,
+                #    fatal here. These are DATA: the compositor samples
+                #    pattern.rgb independently of pattern.a, and case hardening
+                #    reads pattern.g as a ramp lookup coordinate, so colour under
+                #    zero alpha decides what colour the gun is. Zeroing it
+                #    rendered Glock | AXIA's slide as chrome instead of dark
+                #    steel — the exact symptom the compositor's own comments warn
+                #    about. `-exact` is the flag that stops it; IM's equivalent
+                #    (`-define webp:exact`) only exists in ImageMagick 7 and
+                #    bookworm ships 6.9.11.
+                #
+                # 2. The output previously went to "<name>.webp.tmp", and
+                #    ImageMagick reads the format off the extension — ".tmp" is
+                #    unknown, so it fell back to the INPUT format and wrote a PNG
+                #    the rename then dressed up as .webp. Every paint texture on
+                #    every mount was a misnamed PNG, which is why
+                #    /paints/textures sat at 3.4GB.
+                #
+                # 3. LOSSLESS, where this said `-quality 90`. That lossy intent
+                #    never actually executed — because of (2) — so every skin
+                #    ever rendered here, and every shadertest calibration against
+                #    the official art, used lossless input. Fixing the format
+                #    while leaving q90 would have silently changed the pixels of
+                #    all 2106 finishes.
+                subprocess.run(
+                    ["cwebp", "-exact", "-lossless", "-q", "100", src, "-o", tmp],
+                    check=True, capture_output=True,
+                )
             os.replace(tmp, dst)
             return True
         except Exception:
@@ -2046,8 +2628,21 @@ for bi in range(0, len(todo), BATCH):
                 converted += 1
             else:
                 failed.append(f"{os.path.basename(dst)} (convert failed)")
-    print(f"---   textures {converted}/{len(todo)}", flush=True)
-    progress("paint-chain", converted, len(todo))
+    print(f"---   {step} {converted}/{len(todo)}", flush=True)
+    progress(step, converted, len(todo))
+  secs = int(time.time() - started)
+  print(f"--- [{step}] {converted} textures in {secs // 60}m{secs % 60:02d}s", flush=True)
+  if close:
+    # The shell's `step` helper only knows about one heredoc, so this program
+    # closes the step it owns outright.
+    progress(step, converted, len(todo), state="done", secs=secs)
+  return converted, secs
+
+
+paint_done, _ = extract_textures(paint_todo, "paint-chain")
+sticker_done, sticker_secs = extract_textures(sticker_todo, "sticker-art", close=True)
+converted = paint_done + sticker_done
+todo = paint_todo + sticker_todo
 
 shutil.rmtree(raw, ignore_errors=True)
 
@@ -2124,6 +2719,9 @@ PYEOF
   # files this run actually replaced.
   rm -rf "$PAINT_LIVE.old"
   echo "--- Paints live: $(find "$PAINT_LIVE/materials" -type f | wc -l | tr -d "[:space:]") materials, $(find "$PAINT_LIVE/textures" -type f | wc -l | tr -d "[:space:]") textures"
+  # sticker-art is closed by the python above (it alone knows that phase's
+  # duration); paint-chain stays with the shell so the run stamp still records a
+  # time for it. Clearing STEP_NAME here instead dropped BOTH from the stamp.
 fi
 
 # ---- 6. Stamp the pipeline version -------------------------------------------

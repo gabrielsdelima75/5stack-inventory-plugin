@@ -23,3 +23,8 @@ export const isCompact = mediaRef("(max-width: 860px)");
  *  coarse but roomy, a narrow desktop window is fine but precise. Layout keys
  *  off isCompact, interaction affordances key off this. */
 export const isCoarse = mediaRef("(pointer: coarse)");
+
+/** Motion is mostly handled in CSS — style.css neutralises every `animate-*`
+ *  class wholesale. Panels that animate from an inline `:style` have no class
+ *  for that rule to match on, so they have to ask. */
+export const reducedMotion = mediaRef("(prefers-reduced-motion: reduce)");

@@ -1,0 +1,64 @@
+{
+  "inventory": {
+    "notify": {
+      "craft_link_missing": "That craft link points at an item that no longer exists.",
+      "sign_in_to_save": "Sign in to save this to your inventory.",
+      "crafted": "Crafted — it's in your inventory.",
+      "copy_created": "Editable copy created in your inventory.",
+      "synced": "Synced with Steam — {summary}.",
+      "synced_partial": "Synced with Steam — {summary}. Inventory too large to read fully.",
+      "synced_no_changes": "Synced with Steam — everything was already up to date.",
+      "render_upload_failed": "Render made locally, but saving it failed: {error}. Check backend deploy/mount.",
+      "render_not_served": "Render SAVED (backend OK) but /renders/ doesn't serve it back — frontend + backend pods aren't sharing the mount, or a cache is serving a stale 404."
+    },
+    "admin": {
+      "cache": {
+        "cleared_renders": "Cleared card renders — each one re-bakes when it is next viewed.",
+        "cleared_composites": "Cleared paint composites — each skin re-composites once, then is shared again.",
+        "heading": "Assets on disk",
+        "description": "What this server has generated or extracted onto the models mount.",
+        "section_cache": "Cache",
+        "section_extracted": "Extracted from this server's CS2 install",
+        "clear_renders": "Clear renders",
+        "clear_composites": "Clear composites",
+        "rows": {
+          "renders": "Card renders",
+          "renders_hint": "Baked item cards — cleared safely, re-render on view",
+          "composites": "Paint composites",
+          "composites_hint": "Shared skin textures — lets every viewer skip ~38MB of inputs per weapon",
+          "models": "3D models",
+          "models_hint": "Weapon GLBs + composite inputs",
+          "paints": "Paint materials",
+          "paints_hint": "Skin finishes — without these, skins render white",
+          "images": "Item icons",
+          "images_hint": "Flat catalog art for every item"
+        }
+      },
+      "server": {
+        "key_reissued": "New server key issued — the old key is now dead.",
+        "cfg_synced": "invsim commands updated in: {files}"
+      },
+      "extract": {
+        "started": "Extraction job started — expect it to run for a long while.",
+        "finished": "Model extraction finished — 3D assets are live on the mount.",
+        "steps": {
+          "decompile-models": "Decompiling weapon models",
+          "rename-models": "Mapping models to catalog keys",
+          "model-textures": "Compressing model textures",
+          "composite-inputs": "Extracting composite inputs",
+          "charm-anchors": "Reading charm anchors",
+          "sticker-markup": "Reading sticker slots",
+          "econ-icons": "Extracting item icons",
+          "paint-chain": "Extracting paint chain",
+          "sticker-art": "Extracting sticker art",
+          "stamp": "Recording the build"
+        },
+        "time_left": "~{duration} left"
+      },
+      "tests": {
+        "cleared": "Cleared {count} files.",
+        "verdict_failed": "Verdict not saved: {error}"
+      }
+    }
+  }
+}

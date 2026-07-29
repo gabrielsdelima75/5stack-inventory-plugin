@@ -530,6 +530,7 @@ export type CacheStats = {
   paints: DirStat;
   images?: DirStat; // absent on older backends
   models?: DirStat;
+  composites?: DirStat; // shared paint composites; absent on older backends
 };
 export const fetchCacheStats = () => request<CacheStats>("/admin/cache");
 
@@ -564,8 +565,11 @@ export const setAssetCdn = (enabled: boolean) =>
 // Renders only. Paints and icons are extracted from the server's own CS2
 // install with no upstream to re-fetch from, so deleting them breaks rendering
 // until someone re-extracts — the backend rejects any other scope.
-export const clearCache = () =>
-  request<{ cleared: Record<string, number> }>("/admin/cache?scope=renders", { method: "DELETE" });
+// Only DERIVED output is clearable — renders and composites are both rebuilt on
+// demand by the clients that need them. Paints and icons are refused by the
+// backend: those come from the CS2 install and only an extraction restores them.
+export const clearCache = (scope: "renders" | "composites" = "renders") =>
+  request<{ cleared: Record<string, number> }>(`/admin/cache?scope=${scope}`, { method: "DELETE" });
 
 // Admin: model extraction (pulls weapon GLBs + composite inputs from the
 // node's CS2 install straight onto the models mount). Runs as a child process
@@ -597,7 +601,16 @@ export interface ExtractStatus {
    *  own state, plus a unit count for the steps that know one. The whole list
    *  is present from the start so the panel can show what's still to come. */
   progress?: {
-    steps: { name: string; state: "pending" | "running" | "done"; done?: number; total?: number; seconds?: number }[];
+    steps: {
+      name: string;
+      state: "pending" | "running" | "done";
+      done?: number;
+      total?: number;
+      seconds?: number;
+      /** Epoch seconds this step went running — lets the panel count it up.
+       *  Absent on backends/scripts older than v10. */
+      started?: number;
+    }[];
     at: string;
   } | null;
   // CS2 game build. The first three are the build the assets were extracted

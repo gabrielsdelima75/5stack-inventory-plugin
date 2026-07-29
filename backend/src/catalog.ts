@@ -668,3 +668,23 @@ export function slotForItem(id: number): string | null {
   }
   return null;
 }
+
+/**
+ * The material a sticker's inventory image belongs to, or null.
+ *
+ * Stickers are looked up BY IMAGE because that is all a placement carries: the
+ * viewer is handed `/images/<sticker>.webp` and nothing else. Built once, on
+ * first ask — cs2-lib is already in memory, so this is a walk, not a load.
+ */
+let stickerMaterials: Map<string, string> | null = null;
+export function stickerMaterialFor(image: string): string | null {
+  if (!stickerMaterials) {
+    stickerMaterials = new Map();
+    for (const i of items) {
+      if (i.type !== "sticker" && i.type !== "patch") continue;
+      if (typeof i.image !== "string" || typeof i.paintMaterial !== "string") continue;
+      stickerMaterials.set(i.image, i.paintMaterial);
+    }
+  }
+  return stickerMaterials.get(image) ?? null;
+}

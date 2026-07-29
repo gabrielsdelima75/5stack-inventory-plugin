@@ -21,6 +21,7 @@ import {
   Search, FilterX,
 } from "lucide-vue-next";
 import { hasModel, mountViewer, snapshotModel, INCOMPLETE, type ViewerHandle } from "./viewer3d";
+import { takeVerifyFailures } from "./compositeStore";
 import {
   fetchTestCatalog,
   fetchTestList,
@@ -195,6 +196,13 @@ async function renderOne(item: RenderTestItem): Promise<TestResult> {
       legacyPaint: item.legacy,
       wear: wear.value,
       seed: seed.value,
+      // This sweep doubles as the shared composite cache's only practical
+      // warmer. Card bakes deliberately don't write it (mounting one viewer per
+      // inventory item and encoding two lossless 2k images each locks the tab
+      // up), which leaves every finish nobody has opened in 3D uncached. A run
+      // here walks all of them exactly once, already costs an hour of GPU, and
+      // is admin-gated — so it is the one place the extra encode belongs.
+      persistWrite: true,
     });
   } catch (e) {
     return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: e instanceof Error ? e.message : String(e) };
@@ -215,6 +223,21 @@ async function renderOne(item: RenderTestItem): Promise<TestResult> {
   bakeStamp.value = { ...bakeStamp.value, [item.id]: Date.now() };
   // A frame that's nearly all backdrop means the model didn't draw.
   if (stats.coverage < 0.01) return { status: "empty", ...stats, reason: "near-empty frame" };
+
+  // With ?compositeverify=1 this sweep doubles as the composite store's
+  // bit-exactness gate: every finish is rendered from scratch AND compared
+  // against its stored file. Fold any mismatch into THIS finish's result so it
+  // lands in report.json alongside everything else, rather than only in a
+  // console line nobody re-reads. Ship criterion is a delta of exactly 0.
+  const bad = takeVerifyFailures();
+  if (bad.length) {
+    const worst = bad.reduce((a, b) => (b.maxDelta > a.maxDelta ? b : a));
+    return {
+      status: "failed",
+      ...stats,
+      reason: `composite store mismatch (${worst.kind} maxDelta ${worst.maxDelta}, ${worst.differing} bytes)`,
+    };
+  }
   return { status: "ok", ...stats };
 }
 

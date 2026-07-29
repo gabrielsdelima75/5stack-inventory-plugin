@@ -8,7 +8,7 @@ import Fastify, { LogController } from "fastify";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
-import { getStickerMarkup } from "./stickerMarkup.ts";
+import { getStickerMarkup, getCharmModels } from "./stickerMarkup.ts";
 import {
   getWeapons,
   getDefaults,
@@ -30,6 +30,7 @@ import {
   isBaseWeapon,
   getStickerBounds,
   getRenderTestCatalog,
+  stickerMaterialFor,
 } from "./catalog.ts";
 
 // Per-request in/out logging drowns out everything the app actually says
@@ -107,7 +108,10 @@ export function renderKeyForRow(row: { id: number | string; wear: number | strin
   const st = row.stattrak ? "-st" : "";
   return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}-v7.png`;
 }
-app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) => {
+// The size check below allows 3MB, but Fastify's 1MB default would have
+// rejected anything over 1MB before the handler saw it — so that ceiling was
+// never real. Card PNGs are ~100KB, which is why it never surfaced.
+app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
     return reply.status(401).send({ error: "not signed in" });
@@ -134,6 +138,51 @@ app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) =
     return reply.status(500).send({ error: "render store unavailable" });
   }
 });
+
+// ---- Shared paint composites -------------------------------------------------
+// The two textures the client's compositor produces (albedo + rough/metal) are a
+// pure function of (model, body variant, paint material, wear, seed) — nothing
+// about them is per-user. Building them costs ~38MB of composite-input downloads
+// per weapon (an AK's color.png alone is 20.4MB), so the first client to render a
+// given skin uploads the result and every client after that skips the inputs
+// entirely. See src/compositeStore.ts for the client half.
+//
+// Storage is generational: `<dir>/<shaderHash-assetVersion>/<stem>.<kind>.<ext>`.
+// The generation is DERIVED from the shader source, so a compositor fix
+// invalidates every stored bake by itself — the opposite of renderKeyForRow's
+// hand-bumped "-v7", which is a version suffix nobody remembers to bump.
+const COMPOSITES_DIR = process.env.COMPOSITES_DIR ?? "/cs2-models/composites";
+/**
+ * A generation is ONE directory name under the composites root, never a path.
+ *
+ * The first character must be alphanumeric, which is the whole point: the old
+ * `^[\w.-]{1,64}$` accepted `..` (dots are in that class), and every route below
+ * joins the generation straight onto the root. That made `..` mean the shared
+ * asset mount itself — readable through the GET route, writable through the
+ * upload, and, worst of the three, pruneComposites would then delete every
+ * sibling generation and LRU-delete files directly out of /cs2-models, i.e.
+ * extracted game textures.
+ */
+const GEN_RE = /^[A-Za-z0-9][\w.-]{0,63}$/;
+/**
+ * Resolved directory for a generation, or null if the name is malformed or
+ * would land outside the root. Belt and braces on purpose: the regex alone is
+ * what failed here, so the containment is also checked after resolution, and
+ * every caller must go through this rather than path.join the raw parameter.
+ */
+function compositeDir(gen: string): string | null {
+  if (!GEN_RE.test(gen)) return null;
+  const root = path.resolve(COMPOSITES_DIR);
+  const dir = path.resolve(root, gen);
+  return dir.startsWith(root + path.sep) ? dir : null;
+}
+// A generous default: composites are a few MB each and the mount is a node disk,
+// but an unbounded cache on a busy instance would eventually eat the partition
+// the game install lives on.
+const COMPOSITE_CACHE_BYTES = Number(process.env.COMPOSITE_CACHE_BYTES ?? 20 * 1024 * 1024 * 1024);
+// A lossless 4096 projected style is the worst case; 48MB leaves headroom over
+// the largest PNG that can legitimately arrive.
+const COMPOSITE_MAX_BYTES = 48 * 1024 * 1024;
 
 const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
@@ -206,6 +255,244 @@ for (const route of ["/api/renders/:key", "/renders/:key"]) {
     return reply.status(404).send({ error: "not found" });
   }
   });
+}
+
+// ---- Composite store routes ---------------------------------------------------
+// Filename builder. MUST agree with compositeKey() in src/compositeStore.ts.
+//
+// Unlike renderKeyForRow, a disagreement here is harmless: the backend derives
+// the name from the identity it verified, so a drift means clients simply never
+// hit the cache. It can never serve one skin's pixels under another's name.
+// The POST response echoes the derived name so a mismatch shows up in the
+// client console instead of silently costing every hit.
+const safeSeg = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+function compositeStem(id: {
+  model: string; legacy: boolean; material: string; wear: number; seed: number; cap: number;
+}) {
+  return [
+    safeSeg(id.model),
+    id.legacy ? "legacy" : "hd",
+    safeSeg(id.material.replace(/\.(vcompmat|vmat)\.json$/i, "")),
+    Math.min(Math.max(id.wear, 0), 1).toFixed(4),
+    Math.max(0, Math.trunc(id.seed)),
+    `c${id.cap}`,
+  ].join("__");
+}
+// Only the caps the client can actually composite at (see MAX_COMPOSITE_SIZE and
+// MAX_COMPOSITE_SIZE_PROJECTED). Bounded so a client cannot invent an unlimited
+// number of variants of the same skin.
+const COMPOSITE_CAPS = new Set([1024, 2048, 4096]);
+
+// Fastify's default bodyLimit is 1MB, which silently 413s every composite
+// before the handler ever runs — a lossless 2k pair is a few MB and a 4k
+// projected style more. Raised per route rather than globally so nothing else
+// gains the right to accept a 48MB body.
+//
+// The same limit exists OUTSIDE the pod: ingress-nginx also defaults to 1MB, and
+// the `inventory-api` Ingress carries no proxy-body-size annotation. That one
+// cannot be fixed from this repo — the deploy manifests live in the panel repo.
+app.post<{ Params: { gen: string; file: string } }>("/api/composite/:gen/:file", {
+  bodyLimit: COMPOSITE_MAX_BYTES,
+}, async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "not signed in" });
+
+  const gen = request.params.gen;
+  const q = request.query as Record<string, string | undefined>;
+  const kind = q.kind;
+  const cap = Number(q.cap);
+  const wear = Number(q.wear);
+  const seed = Number(q.seed);
+  const model = q.model ?? "";
+  const material = q.material ?? "";
+  const legacy = q.legacy === "1";
+  const dir = compositeDir(gen);
+  if (
+    !dir ||
+    (kind !== "albedo" && kind !== "rm") ||
+    !COMPOSITE_CAPS.has(cap) ||
+    !Number.isFinite(wear) || wear < 0 || wear > 1 ||
+    !Number.isInteger(seed) || seed < 0 ||
+    !model || !material
+  ) {
+    return reply.status(400).send({ error: "bad composite identity" });
+  }
+
+  const body = request.body as Buffer;
+  const ext = /^\x89PNG/.test(body?.subarray?.(0, 4).toString("latin1") ?? "")
+    ? "png"
+    : body?.subarray?.(0, 4).toString("latin1") === "RIFF" &&
+      body.subarray(8, 12).toString("latin1") === "WEBP"
+      ? "webp"
+      : null;
+  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > COMPOSITE_MAX_BYTES || !ext) {
+    return reply.status(400).send({ error: "bad composite" });
+  }
+
+  // The store is SHARED, so a client does not get to choose which skin its
+  // pixels land on. Every uploaded tuple has to describe an item the caller
+  // actually owns: the wear/seed pair is effectively unique per instance, so
+  // this bounds the blast radius of a doctored client to its own items rather
+  // than to every viewer of that skin.
+  const { rows } = await pool.query(
+    `SELECT item_id FROM inventory.owned_items
+      WHERE steam_id = $1 AND seed = $2 AND ROUND(wear::numeric, 4) = ROUND($3::numeric, 4)`,
+    [identity.steamId, seed, wear],
+  );
+  const owns = getItemsByIds(rows.map((r: { item_id: number }) => Number(r.item_id))).some(
+    (i) => i.model === model && i.paintMaterial === material && !!i.legacyPaint === legacy,
+  );
+  if (!owns) return reply.status(403).send({ error: "not your item" });
+
+  const stem = compositeStem({ model, legacy, material, wear, seed, cap });
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    // A client that could not produce lossless WebP fell back to PNG (see
+    // encoderFormat in src/compositeStore.ts). Transcode it here so the store
+    // does not end up permanently holding a ~3x larger file just because the
+    // first viewer of that skin used a browser with a lossy WebP encoder.
+    // LOSSLESS, so this re-encode cannot change a pixel. ImageMagick is already
+    // in the image for the econ icons; without it the PNG is kept as-is.
+    let out = body;
+    let outExt = ext;
+    if (ext === "png" && (await magickAvailable())) {
+      const converted = await pngToLosslessWebp(body, dir);
+      if (converted) {
+        out = converted;
+        outExt = "webp";
+      }
+    }
+    const file = `${stem}.${kind}.${outExt}`;
+    const dest = path.join(dir, file);
+    // First write wins: re-uploading is pure cost, and leaving the original in
+    // place means a client that somehow produces different pixels cannot
+    // overwrite a bake other viewers are already caching hard.
+    if (await fs.access(dest).then(() => true, () => false)) return { ok: true, file, existed: true };
+    // Write-then-rename so a reader never sees a half-written image — the same
+    // discipline the extractor uses for textures.
+    const tmp = `${dest}.${process.pid}.tmp`;
+    await fs.writeFile(tmp, out);
+    await fs.rename(tmp, dest);
+    void pruneComposites();
+    return { ok: true, file };
+  } catch {
+    return reply.status(500).send({ error: "composite store unavailable" });
+  }
+});
+
+let magickChecked: Promise<boolean> | null = null;
+function magickAvailable(): Promise<boolean> {
+  magickChecked ??= new Promise<boolean>((resolve) => {
+    const p = spawn("convert", ["-version"], { stdio: "ignore" });
+    p.on("error", () => resolve(false));
+    p.on("close", (code) => resolve(code === 0));
+  });
+  return magickChecked;
+}
+
+/** PNG buffer -> lossless WebP buffer, or null if the conversion failed. */
+async function pngToLosslessWebp(png: Buffer, dir: string): Promise<Buffer | null> {
+  const base = path.join(dir, `.transcode.${process.pid}.${Date.now()}`);
+  const src = `${base}.png`;
+  const dst = `${base}.webp`;
+  try {
+    await fs.writeFile(src, png);
+    const ok = await new Promise<boolean>((resolve) => {
+      const p = spawn("convert", [src, "-define", "webp:lossless=true", "-quality", "100", dst], {
+        stdio: "ignore",
+      });
+      p.on("error", () => resolve(false));
+      p.on("close", (code) => resolve(code === 0));
+    });
+    return ok ? await fs.readFile(dst) : null;
+  } catch {
+    return null;
+  } finally {
+    await fs.rm(src, { force: true }).catch(() => {});
+    await fs.rm(dst, { force: true }).catch(() => {});
+  }
+}
+
+// Served under both paths for the same reason renders are: /api/* provably
+// reaches this pod, bare /composites/* backs nginx's static-miss fallback.
+for (const route of ["/api/composites/:gen/:file", "/composites/:gen/:file"]) {
+  app.get<{ Params: { gen: string; file: string } }>(route, async (request, reply) => {
+    const { gen, file } = request.params;
+    const dir = compositeDir(gen);
+    if (!dir || !/^[\w.-]+\.(png|webp)$/.test(file)) {
+      return reply.status(404).send({ error: "not found" });
+    }
+    try {
+      const buf = await fs.readFile(path.join(dir, file));
+      // Genuinely immutable: the generation directory covers the shader and the
+      // extraction, and the stem covers the item — so this URL can never change
+      // meaning. No ?v= dance needed, unlike the paint materials.
+      reply.header("Cache-Control", "public, max-age=31536000, immutable");
+      return reply.type(file.endsWith(".webp") ? "image/webp" : "image/png").send(buf);
+    } catch {
+      return reply.status(404).send({ error: "not found" });
+    }
+  });
+}
+
+// Trim the whole composites tree to COMPOSITE_CACHE_BYTES, least-recently-used
+// first, across EVERY generation.
+//
+// It deliberately does not know or care which generation is "current". An
+// earlier version deleted every directory that wasn't the uploading client's
+// `gen`, which is wrong twice over:
+//
+//   - `gen` is a request parameter. A doctored client could name a generation
+//     nobody uses and take the entire shared cache with it.
+//   - It is not even adversarial to hit. `gen` is a hash of the client's shader
+//     source, so during any rollout two builds are live at once and each upload
+//     would delete the other build's cache — the two would erase each other in a
+//     loop for as long as the rollout lasted.
+//
+// Ageing them out by LRU handles retirement on its own: nothing reads a
+// superseded generation, so its files become the oldest and go first, and a
+// rollout keeps both caches until the disk actually needs the space. Empty
+// directories are swept afterwards.
+let prunePending: Promise<void> | null = null;
+function pruneComposites(): Promise<void> {
+  prunePending ??= (async () => {
+    try {
+      const gens = await fs.readdir(COMPOSITES_DIR, { withFileTypes: true }).catch(() => []);
+      const files: { path: string; size: number; used: number }[] = [];
+      let total = 0;
+      for (const g of gens) {
+        if (!g.isDirectory()) continue;
+        const dir = path.join(COMPOSITES_DIR, g.name);
+        for (const name of await fs.readdir(dir).catch(() => [])) {
+          const full = path.join(dir, name);
+          const st = await fs.stat(full).catch(() => null);
+          if (!st?.isFile()) continue;
+          // atime where the filesystem keeps it (relatime updates it once a day,
+          // which is plenty for an LRU measured in weeks); mtime is the floor.
+          files.push({ path: full, size: st.size, used: Math.max(st.atimeMs, st.mtimeMs) });
+          total += st.size;
+        }
+      }
+      if (total > COMPOSITE_CACHE_BYTES) {
+        files.sort((a, b) => a.used - b.used);
+        for (const f of files) {
+          if (total <= COMPOSITE_CACHE_BYTES) break;
+          await fs.rm(f.path, { force: true }).catch(() => {});
+          total -= f.size;
+        }
+      }
+      // Sweep generation directories the trim emptied. rmdir, not rm -rf: it
+      // refuses on a non-empty directory, so a file written between the scan and
+      // now cannot be caught by it.
+      for (const g of gens) {
+        if (!g.isDirectory()) continue;
+        await fs.rmdir(path.join(COMPOSITES_DIR, g.name)).catch(() => {});
+      }
+    } finally {
+      prunePending = null;
+    }
+  })();
+  return prunePending;
 }
 
 // ---- Skin test suite --------------------------------------------------------
@@ -349,6 +636,73 @@ for (const route of ["/api/tests/img/:key", "/tests/:key"]) {
 // placement out; the anchors are what let the viewer put a sticker where the
 // game will actually draw it. Markup is read off the extracted mount, so an
 // un-extracted mount (or a knife) degrades to bounds-only rather than failing.
+// The sticker ART the game actually draws, for a sticker's inventory image.
+//
+// `item.image` is the INVENTORY ICON — 512x384 with the art inset and pushed to
+// one edge (measured on Dystopian Gaze: 11.5% at the sides, flush top, 11.2%
+// clear at the bottom). The game draws `g_tSticker0` from the sticker's own
+// material instead: square, no padding. Drawing the icon as a decal squashed
+// every sticker and hung it above its own anchor.
+//
+// Resolved here rather than shipped on every catalog row because it costs a file
+// read per sticker and a viewer needs at most five. Answers null — never an
+// error — when the texture isn't on the mount, which is the case on any mount
+// extracted before v12; the viewer then falls back to the icon.
+const stickerArtCache = new Map<string, string | null>();
+app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (request) => {
+  const image = request.query.image ?? "";
+  if (!image.startsWith("/images/") || image.includes("..")) return { art: null };
+  const hit = stickerArtCache.get(image);
+  if (hit !== undefined) return { art: hit };
+  let art: string | null = null;
+  try {
+    const material = stickerMaterialFor(image);
+    if (material) {
+      const doc = JSON.parse(
+        await fs.readFile(path.join(PAINTS_DIR, "materials", path.basename(material)), "utf8"),
+      ) as { m_textureParams?: { m_name?: string; m_pValue?: string }[] };
+      const tex = doc.m_textureParams?.find((t) => t.m_name === "g_tSticker0")?.m_pValue;
+      // Only claim it once the file is really there — the material names the
+      // texture whether or not the extraction pulled it.
+      if (tex?.startsWith("/textures/")) {
+        await fs.access(path.join(PAINTS_DIR, "textures", path.basename(tex)));
+        art = tex;
+      }
+    }
+  } catch {
+    art = null;
+  }
+  // Only successes are cached. A null means "not on this mount yet", and the
+  // very next thing that changes it is an extraction — which would otherwise be
+  // invisible until the pod restarted, leaving every sticker on the icon.
+  if (art) stickerArtCache.set(image, art);
+  return { art };
+});
+
+// Which model and material a charm should render as.
+//
+// Asked by image, because that is all a charm placement carries. Answers null on
+// a mount that predates the charm-models step, and the viewer then falls back to
+// the charm's flat art — the behaviour every charm had before.
+app.get<{ Querystring: { image?: string } }>("/api/catalog/charm-model", async (request) => {
+  // Callers hold a fully-resolved image URL, not a path — the viewer's charm
+  // placement carries `https://<assets>/images/kc_*.webp`. Taking the pathname
+  // accepts both; requiring a bare path answered null for EVERY charm, which
+  // looks exactly like a mount that has no charm models at all.
+  const raw = request.query.image ?? "";
+  let image = raw;
+  try {
+    if (/^https?:\/\//i.test(raw)) image = new URL(raw).pathname;
+  } catch {
+    return { charm: null };
+  }
+  if (!image.startsWith("/images/") || image.includes("..")) return { charm: null };
+  // cs2-lib names assets `<game stem>_<hash8>.webp`; the stem is the econ name.
+  const stem = path.basename(image).replace(/\.webp$/i, "").replace(/_[0-9a-f]{8}$/i, "");
+  const charm = (await getCharmModels())[stem] ?? null;
+  return { charm };
+});
+
 app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", async (request) => {
   const model = request.params.model;
   const [bounds, slots] = await Promise.all([
@@ -1785,13 +2139,18 @@ function cachedDirStats() {
   if (dirStatsMemo && Date.now() - dirStatsMemo.at < DIR_STATS_TTL_MS) return dirStatsMemo.value;
   const modelsDir = path.join(path.dirname(RENDERS_DIR), "models");
   const value = (async () => {
-    const [renders, paints, images, models] = await Promise.all([
+    const [renders, paints, images, models, composites] = await Promise.all([
       dirStats(RENDERS_DIR),
       dirStats(PAINTS_DIR),
       dirStats(IMAGES_DIR),
       dirStats(modelsDir),
+      // Client-baked, self-invalidating and LRU-trimmed, so it needs no
+      // attention — but it is the one directory here that grows from ordinary
+      // use rather than from an extraction, so an operator watching disk should
+      // be able to see it.
+      dirStats(COMPOSITES_DIR),
     ]);
-    return { renders, paints, images, models };
+    return { renders, paints, images, models, composites };
   })();
   // Don't let a failed walk stick around as a poisoned memo.
   value.catch(() => {
@@ -1807,16 +2166,25 @@ app.delete<{ Querystring: { scope?: string } }>("/api/admin/cache", async (reque
   // are refused rather than silently downgraded, so an old client (or a stale
   // bookmarked request) can't quietly wipe the paint chain again.
   const scope = request.query.scope ?? "renders";
-  if (scope !== "renders") {
+  // Composites are clearable for the same reason renders are — they are derived
+  // output this server can rebuild — but paints/icons still are not: those come
+  // from the CS2 install and only an extraction can restore them.
+  if (scope !== "renders" && scope !== "composites") {
     return reply.status(400).send({
       error:
-        "Only card renders can be cleared. Paints and icons are extracted from this server's CS2 install — re-run the model extraction to rebuild them.",
+        "Only card renders and paint composites can be cleared. Paints and icons are extracted from this server's CS2 install — re-run the model extraction to rebuild them.",
     });
   }
-  const before = await dirStats(RENDERS_DIR);
-  await fs.rm(RENDERS_DIR, { recursive: true, force: true }).catch(() => {});
-  await fs.mkdir(RENDERS_DIR, { recursive: true }).catch(() => {});
-  return { cleared: { renders: before.files } };
+  const dir = scope === "composites" ? COMPOSITES_DIR : RENDERS_DIR;
+  const before = await dirStats(dir);
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  await fs.mkdir(dir, { recursive: true }).catch(() => {});
+  // Drop the memo. The panel re-reads the stats the instant this returns, and
+  // cachedDirStats would otherwise serve its 8-second-old walk — so a clear that
+  // worked perfectly reported the same file count it started with, which reads
+  // exactly like a clear that did nothing.
+  dirStatsMemo = null;
+  return { cleared: { [scope]: before.files } };
 });
 
 // ---- Model extraction (admins) ----------------------------------------------
@@ -2137,6 +2505,10 @@ type ExtractStep = {
   done?: number;
   total?: number;
   seconds?: number;
+  /** Epoch seconds the step went running. Lets the panel show elapsed + an ETA
+   *  for the step in flight, which is the only thing that distinguishes a long
+   *  step from a wedged one. */
+  started?: number;
 };
 type ExtractProgress = { steps: ExtractStep[]; at: string };
 async function readExtractProgress(): Promise<ExtractProgress | null> {
@@ -2152,6 +2524,11 @@ async function readExtractProgress(): Promise<ExtractProgress | null> {
         ...(typeof s.done === "number" ? { done: s.done } : {}),
         ...(typeof s.total === "number" ? { total: s.total } : {}),
         ...(typeof s.seconds === "number" ? { seconds: s.seconds } : {}),
+        // This projection is a WHITELIST — a field the script starts writing is
+        // dropped here until it is named, silently and with no type error, and
+        // the UI just renders nothing. That is exactly how `started` went
+        // missing after the script and the panel were both already correct.
+        ...(typeof s.started === "number" ? { started: s.started } : {}),
       }];
     });
     return { steps, at: typeof p.at === "string" ? p.at : "" };

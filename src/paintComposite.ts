@@ -21,6 +21,16 @@
 // - pattern & wear & grunge scale all multiply weaponLength/36 for
 //   spray/anodized-air styles, uvScale for everything else
 import { getAssetOrigin, withAssetVersion } from "./api";
+import {
+  applyCompositeTextureState,
+  compositeKey,
+  loadStoredComposite,
+  registerCompositeShader,
+  storeComposite,
+  verifyEnabled,
+  verifyStoredComposite,
+  type CompositeIdentity,
+} from "./compositeStore";
 
 type THREE = typeof import("three");
 
@@ -623,11 +633,13 @@ export function loadWeaponInputs(model: string, legacy = false): Promise<WeaponI
   if (!cached) {
     cached = (async () => {
       const load = async (d: string): Promise<WeaponInputs | null> => {
-        const res = await fetch(`${getAssetOrigin()}/models/${encodeURIComponent(d)}/meta.json`);
+        // Version-stamped like everything else under /models: these filenames
+        // are fixed while an extraction rewrites what is behind them.
+        const res = await fetch(withAssetVersion(`${getAssetOrigin()}/models/${encodeURIComponent(d)}/meta.json`));
         if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) return null;
         const meta = (await res.json()) as WeaponInputs & { textures?: Record<string, string> };
         const base = `${getAssetOrigin()}/models/${encodeURIComponent(d)}/`;
-        const rel = (p?: string) => (p ? base + p : undefined);
+        const rel = (p?: string) => (p ? withAssetVersion(base + p) : undefined);
         return {
           ao: rel(meta.textures?.ao),
           masks: rel(meta.textures?.masks),
@@ -1535,6 +1547,12 @@ void main() {
 }
 `;
 
+// The persisted-composite generation is derived from these sources, so editing
+// either one above invalidates every stored bake automatically. That is the
+// whole point: the card renders learned the hard way that a hand-bumped version
+// suffix is a version suffix nobody bumps.
+registerCompositeShader(VERT, FRAG);
+
 // ---- Texture loading ------------------------------------------------------------
 // One shared cache across composites; colorSpace flags follow the shader's
 // SrgbRead() declarations so the GPU linearizes exactly what the game does.
@@ -1689,7 +1707,16 @@ const MAX_COMPOSITE_SIZE_PROJECTED = COARSE_POINTER ? 1024 : 4096;
 type CacheEntry = { result: Omit<CompositeResult, "release">; refs: number; dispose: () => void };
 type RendererCache = Map<string, CacheEntry>;
 const compositeCaches = new WeakMap<import("three").WebGLRenderer, RendererCache>();
-const COMPOSITE_CACHE_MAX = 4;
+// Four made sense when every viewer built its own renderer and its own cache:
+// the entries died seconds later anyway, so a bigger number only raised the
+// peak. With ONE shared renderer (getSharedGL) this is now a single app-wide
+// LRU that survives teardown, and 4 means cycling through five weapons re-fetches
+// and re-decodes the first one every time round.
+//
+// Sized against the memory note above: a 2k pair is ~45MB, so 8 is ~360MB on
+// desktop — real, but the alternative is re-decoding two 2k textures per switch.
+// Coarse-pointer devices cap composites at 1k, which quarters it to ~90MB.
+const COMPOSITE_CACHE_MAX = COARSE_POINTER ? 4 : 8;
 
 function cacheFor(renderer: import("three").WebGLRenderer): RendererCache {
   let cache = compositeCaches.get(renderer);
@@ -1740,6 +1767,20 @@ export async function compositePaint(
      *  through the seeded UV transform, 3 = pattern.a) into `result.debug`.
      *  Part of the cache key so a debug render never satisfies a normal one. */
     debug?: 2 | 3 | 4;
+    /** Identity of this composite in the SHARED on-disk store. Supplying it lets
+     *  a bake made by any other client on this instance satisfy the request
+     *  outright — which skips every input texture below, and those are the
+     *  bytes that make a cold 3D open slow. Omit for one-off renders that should
+     *  neither read nor write the store (the shader test rigs). */
+    persist?: Omit<CompositeIdentity, "cap">;
+    /** Whether this viewer may also WRITE what it renders back to the store.
+     *  Reading is always worth it; writing is not. Persisting costs two
+     *  synchronous readbacks and two lossless encodes, and the card backfill
+     *  mounts a viewer per inventory item — paying that ~150 times over during
+     *  the heaviest sweep the page performs locked the tab up. So background and
+     *  snapshot viewers read the cache and let an interactive viewer, which
+     *  renders one skin at a time while the user looks at it, fill it. */
+    persistWrite?: boolean;
   },
 ): Promise<CompositeResult | null> {
   const THREE = three;
@@ -1755,6 +1796,35 @@ export async function compositePaint(
     cache.delete(key);
     cache.set(key, hit);
     return { ...hit.result, release: makeRelease(cache, key) };
+  }
+
+  // Styles 2 (spraypaint) and 5 (anodized airbrushed) build the pattern from a
+  // triplanar projection and composite at a higher cap — see the constants. Read
+  // straight off the def so the store lookup below can run before ANY texture
+  // fetch; that ordering is the entire optimisation.
+  const wantsProjection = def.style === 2 || def.style === 5;
+  const sizeCap = wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE;
+
+  // A debug pass is a diagnostic render of intermediate values, not the skin —
+  // it must never be served from the shared store, nor written to it.
+  const storeStem =
+    opts.persist && !opts.debug ? compositeKey({ ...opts.persist, cap: sizeCap }) : null;
+  // ?compositeverify=1 renders the skin from scratch even on a hit, so the two
+  // can be compared below. Serving the cached pair here would prove nothing.
+  if (storeStem && !verifyEnabled()) {
+    const stored = await loadStoredComposite(THREE, renderer, storeStem);
+    if (stored) {
+      // Filed in the same refcounted LRU as a rendered pair so callers see one
+      // lifetime contract and release() means the same thing either way.
+      const entry: CacheEntry = {
+        result: { albedo: stored.albedo, rm: stored.rm, incomplete: false },
+        refs: 1,
+        dispose: stored.dispose,
+      };
+      cache.set(key, entry);
+      evictIfNeeded(cache);
+      return { ...entry.result, release: makeRelease(cache, key) };
+    }
   }
 
   // Per-style pattern colorspace: mask styles read linear; custom paint jobs,
@@ -1812,7 +1882,6 @@ export async function compositePaint(
   ]);
   const magTex = magUrl ? await loadTex(THREE, magUrl, { srgb: false, wrap: false }) : null;
   // Projected styles only — no point fetching a 1MB EXR for the other seven.
-  const wantsProjection = def.style === 2 || def.style === 5;
   const posTex = wantsProjection && opts.weapon?.position ? await loadExr(THREE, opts.weapon.position) : null;
   const surfTex =
     wantsProjection && opts.weapon?.surface
@@ -1887,7 +1956,6 @@ export async function compositePaint(
   const grgX = texXform(sv.grungeRot, sv.grungeScale * sizeScale, sv.grungeOffsetX, sv.grungeOffsetY);
 
   const imgW = (t: import("three").Texture | null) => (t?.image as { width?: number } | undefined)?.width ?? 0;
-  const sizeCap = wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE;
   const size = Math.min(Math.max(imgW(pattern), imgW(baseColor), 1024), sizeCap);
 
   quadGeom ??= (() => {
@@ -2099,17 +2167,16 @@ export async function compositePaint(
       minFilter: THREE.LinearMipmapLinearFilter,
       magFilter: THREE.LinearFilter,
     });
-    rt.texture.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-    rt.texture.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    // Shared with the store's loader so a rendered pair and a loaded pair can
+    // never disagree about colour space, UV set or wrapping. Paint UV =
+    // TEXCOORD_0: CS2's composite output REPLACES g_tColor in the weapon
+    // material, which binds texCoord 0 (verified in the GLB json).
+    applyCompositeTextureState(THREE, renderer, rt.texture, srgb);
+    // The one setting that is NOT shared: a render target is sampled with GL's
+    // bottom-left origin and flipY does not apply to it, whereas a texture
+    // decoded from an image file needs three's default flipY:true to land the
+    // same way up. See loadStoredComposite.
     rt.texture.flipY = false;
-    // Paint UV = TEXCOORD_0: CS2's composite output REPLACES g_tColor in the
-    // weapon material, which binds its textures with texCoord 0 (verified in
-    // the GLB json). TEXCOORD_1 is the STICKER uv set — sampling paint
-    // through it scatters the pattern into patchwork.
-    rt.texture.channel = 0;
-    // Some faces carry UVs outside [0,1] (mirrored second side) — clamping
-    // would smear edge texels into streaks.
-    rt.texture.wrapS = rt.texture.wrapT = THREE.RepeatWrapping;
     return rt;
   };
   const prevRT = renderer.getRenderTarget();
@@ -2152,6 +2219,25 @@ export async function compositePaint(
     [def.paintRoughnessTex, roughTex],
     [def.paintMetalnessTex, metalTex],
   ] as const).some(([named, loaded]) => !!named && !loaded);
+
+  // Hand the freshly rendered pair to the shared store so the next client — on
+  // any machine — skips everything above. Gated on `incomplete` for the same
+  // reason card bakes are: the key is stable, so a composite rendered against
+  // half-extracted assets would be served as the truth forever.
+  if (storeStem && !incomplete) {
+    const req = {
+      stem: storeStem,
+      identity: { ...opts.persist!, cap: sizeCap },
+      size,
+      albedo: albedoRT,
+      rm: rmRT,
+    };
+    // Verification mode compares this render against what is already stored
+    // instead of adding to it — writing first would be comparing the file to
+    // itself, which passes no matter how wrong the flip is.
+    if (verifyEnabled()) void verifyStoredComposite(renderer, req);
+    else if (opts.persistWrite) storeComposite(renderer, req);
+  }
 
   const entry: CacheEntry = {
     result: { albedo: albedoRT.texture, rm: rmRT.texture, debug: debugRT?.texture, incomplete },

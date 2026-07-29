@@ -39,6 +39,20 @@ export interface StickerSlot {
   rotation: number;
   /** Autograph / Team1 / Team2 / Map — souvenir tagging, NOT an ordering. */
   special?: string;
+  /**
+   * The authored region this slot may be placed on: flat triangle soup (x,y per
+   * vertex, 3 vertices per triangle) in the same space as `offset`.
+   *
+   * This is the only ground truth for where a sticker is ALLOWED to sit.
+   * cs2-lib's per-weapon bounds are a rectangle drawn around it and they
+   * overshoot badly — measured on the M4A1-S, the box runs to u +1.007 where the
+   * real region ends at +0.467. A drag clamped to the box therefore lands on a
+   * UV that is nowhere on the unwrap, and the sticker stops dead with no way for
+   * the user to know why.
+   *
+   * Absent on mounts extracted before v12.
+   */
+  region?: number[];
 }
 
 const FILE = path.join(MODELS_DIR, "sticker-markup.json");
@@ -63,6 +77,11 @@ function validate(raw: unknown): StickerSlot[] {
     const scale = Number(e.scale);
     if (!off || off.length !== 2 || off.some((v) => !Number.isFinite(v))) continue;
     if (!Number.isFinite(index) || !Number.isFinite(scale)) continue;
+    // Whole triangles or nothing: a truncated region would quietly shrink where
+    // a sticker may go, which is indistinguishable from the weapon simply having
+    // a smaller sticker area.
+    const region = Array.isArray(e.region) ? (e.region as unknown[]).map(Number) : null;
+    const usable = region && region.length >= 6 && region.length % 6 === 0 && region.every((v) => Number.isFinite(v));
     out.push({
       index,
       mesh: String(e.mesh ?? "body_hd"),
@@ -70,6 +89,7 @@ function validate(raw: unknown): StickerSlot[] {
       scale,
       rotation: Number(e.rotation) || 0,
       special: e.special ? String(e.special) : undefined,
+      ...(usable ? { region: region as number[] } : {}),
     });
   }
   return out;
@@ -107,4 +127,55 @@ export async function getStickerMarkup(model: string): Promise<StickerSlot[]> {
 /** How many sticker slots this weapon really has — 4, 5 or 6, never a fixed 5. */
 export function slotCount(slots: StickerSlot[], mesh = "body_hd"): number {
   return slots.filter((s) => s.mesh === mesh).length;
+}
+
+/**
+ * Which model and material a charm is, from the econ schema — see the
+ * charm-models step in extract-models.sh.
+ *
+ * A charm is NOT one model per charm: the community collections are a shared
+ * blank mesh wearing their own material (23 of 82 on the current build). The
+ * viewer therefore cannot guess the model from the item's image name, which is
+ * why those charms rendered as flat art.
+ *
+ * Keyed by the same stem the item's image carries (kc_missinglink_slime), so a
+ * caller with only a placement's image can resolve it.
+ */
+export interface CharmModel {
+  /** The keychain definition index, for cross-checking against cs2-lib. */
+  index: number;
+  /** GLB name under /models, without the extension. */
+  model: string;
+  /** `/materials/<file>.vmat.json` when the model is a shared blank whose
+   *  material IS the charm. Absent when the model carries its own. */
+  material?: string;
+}
+
+const CHARM_FILE = path.join(MODELS_DIR, "charm-models.json");
+let charmCache: { mtimeMs: number; map: Record<string, CharmModel> } | null = null;
+
+/** Charm model map, or {} when the mount predates the charm-models step. */
+export async function getCharmModels(): Promise<Record<string, CharmModel>> {
+  try {
+    const { mtimeMs } = await stat(CHARM_FILE);
+    if (charmCache && charmCache.mtimeMs === mtimeMs) return charmCache.map;
+    const doc = JSON.parse(await readFile(CHARM_FILE, "utf8")) as Record<string, unknown>;
+    const map: Record<string, CharmModel> = {};
+    for (const [name, raw] of Object.entries(doc)) {
+      const e = raw as Record<string, unknown>;
+      const model = typeof e.model === "string" ? e.model : null;
+      if (!model || !/^[\w.-]+$/.test(model)) continue;
+      map[name] = {
+        index: Number(e.index) || 0,
+        model,
+        ...(typeof e.material === "string" && e.material.startsWith("/materials/")
+          ? { material: e.material }
+          : {}),
+      };
+    }
+    charmCache = { mtimeMs, map };
+    return map;
+  } catch {
+    return {};
+  }
 }

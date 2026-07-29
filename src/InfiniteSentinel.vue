@@ -19,6 +19,7 @@
  * stops growing simply stops being asked.
  */
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { scrollRoot } from "./dom";
 
 const props = withDefaults(
   defineProps<{
@@ -35,14 +36,6 @@ const emit = defineEmits<{ hit: [] }>();
 
 const el = ref<HTMLElement | null>(null);
 let io: IntersectionObserver | null = null;
-
-function scrollRoot(from: HTMLElement): HTMLElement | null {
-  for (let p = from.parentElement; p; p = p.parentElement) {
-    const overflow = getComputedStyle(p).overflowY;
-    if (overflow === "auto" || overflow === "scroll") return p;
-  }
-  return null; // no scrolling ancestor — fall back to the viewport
-}
 
 function rearm() {
   const node = el.value;

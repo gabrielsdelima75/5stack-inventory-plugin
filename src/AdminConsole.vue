@@ -5,7 +5,7 @@
 //
 // Each side tab is a route (/admin, /admin/assets, /admin/models) — same as
 // settings, where the nav is links rather than in-page anchors.
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   Loader2,
   Copy,
@@ -56,6 +56,13 @@ const emit = defineEmits<{
   (e: "navigate", section: string): void;
   (e: "back"): void;
 }>();
+
+/** App owns the catalogue and the resolution order; this is the same resolver.
+ *  Defaulted so the component still renders if it is ever mounted outside App. */
+const tr = inject<(key: string, fallback: string, named?: Record<string, unknown>) => string>(
+  "tr",
+  (_key, fallback) => fallback,
+);
 
 const isAdmin = computed(() => props.user?.role === "administrator");
 const fail = (e: unknown) => emit("notify", e instanceof Error ? e.message : String(e), "error");
@@ -109,7 +116,7 @@ async function rotateKey() {
     const res = await generateServerApiKey();
     serverApiKey.value = res.key;
     applyCfgSync(res.cfg);
-    emit("notify", "New server key issued — the old key is now dead.", "success");
+    emit("notify", tr("inventory.admin.server.key_reissued", "New server key issued — the old key is now dead."), "success");
   } catch (e) {
     fail(e);
   } finally {
@@ -162,7 +169,15 @@ const fmtBytes = (b: number) =>
 const cacheRows = computed(() => {
   const s = cacheStats.value;
   if (!s) return [];
-  return [{ key: "renders", label: "Card renders", hint: "Baked item cards — cleared safely, re-render on view", ...s.renders }];
+  return [
+    { key: "renders", label: "Card renders", hint: "Baked item cards — cleared safely, re-render on view", ...s.renders },
+    {
+      key: "composites",
+      label: "Paint composites",
+      hint: "Shared skin textures — lets every viewer skip ~38MB of inputs per weapon",
+      ...(s.composites ?? { files: 0, bytes: 0 }),
+    },
+  ];
 });
 const extractedRows = computed(() => {
   const s = cacheStats.value;
@@ -210,13 +225,19 @@ async function refreshCacheStats() {
     cacheStats.value = null;
   }
 }
-async function doClearCache() {
+async function doClearCache(scope: "renders" | "composites" = "renders") {
   if (cacheBusy.value) return;
   cacheBusy.value = true;
   try {
-    await clearCache();
-    emit("cache-cleared", "renders");
-    emit("notify", "Cleared card renders — each one re-bakes when it is next viewed.", "success");
+    await clearCache(scope);
+    emit("cache-cleared", scope);
+    emit(
+      "notify",
+      scope === "composites"
+        ? tr("inventory.admin.cache.cleared_composites", "Cleared paint composites — each skin re-composites once, then is shared again.")
+        : tr("inventory.admin.cache.cleared_renders", "Cleared card renders — each one re-bakes when it is next viewed."),
+      "success",
+    );
     await refreshCacheStats();
   } catch (e) {
     fail(e);
@@ -253,7 +274,7 @@ async function refreshExtractStatus() {
   } else if (!extractLive.value && extractPoll) {
     stopPoll();
     if (wasLive && extractStatus.value?.state === "succeeded") {
-      emit("notify", "Model extraction finished — 3D assets are live on the mount.", "success");
+      emit("notify", tr("inventory.admin.extract.finished", "Model extraction finished — 3D assets are live on the mount."), "success");
     }
   }
 }
@@ -308,11 +329,14 @@ watch(extractLive, (live) => {
 const STEP_LABELS: Record<string, string> = {
   "decompile-models": "Decompiling weapon models",
   "rename-models": "Mapping models to catalog keys",
+  "model-textures": "Compressing model textures",
   "composite-inputs": "Extracting composite inputs",
   "charm-anchors": "Reading charm anchors",
   "sticker-markup": "Reading sticker slots",
   "econ-icons": "Extracting item icons",
   "paint-chain": "Extracting paint chain",
+  "sticker-art": "Extracting sticker art",
+  "sticker-art": "Extracting sticker art",
   stamp: "Recording the build",
 };
 
@@ -321,7 +345,7 @@ const extractProgress = computed(() => {
   if (!steps?.length || !extractLive.value) return null;
   return steps.map((s, i) => ({
     ...s,
-    label: STEP_LABELS[s.name] ?? s.name,
+    label: tr(`inventory.admin.extract.steps.${s.name}`, STEP_LABELS[s.name] ?? s.name),
     last: i === steps.length - 1,
     // Only steps that report a unit count get a real percentage. A running step
     // without one is genuinely indeterminate — showing 0% would read as stuck.
@@ -329,17 +353,39 @@ const extractProgress = computed(() => {
     // One metric per state, assembled HERE so the template can't recombine the
     // parts wrongly: a done step kept its last done/total and was rendering
     // "1m 24s · 85%", which claims it stopped short.
-    detail:
-      s.state === "running"
-        ? [
-            s.total != null ? `${(s.done ?? 0).toLocaleString()} / ${s.total.toLocaleString()}` : "",
-            s.total ? `${Math.min(100, Math.round(((s.done ?? 0) / s.total) * 100))}%` : "",
-          ]
-            .filter(Boolean)
-            .join(" · ")
-        : s.state === "done" && s.seconds != null
-          ? fmtDuration(s.seconds)
-          : "",
+    // Split into two ranks rather than one run of four values separated by
+    // dots. Everything at equal weight gave the eye nothing to land on, and the
+    // percentage restated the bar sitting directly underneath it — so the
+    // percentage is gone and the count leads.
+    //   primary   17 / 41          what you scan for
+    //   secondary 39s · ~55s left  elapsed, then remaining
+    ...(() => {
+      if (s.state === "done") {
+        return { primary: s.seconds != null ? fmtDuration(s.seconds) : "", secondary: "" };
+      }
+      if (s.state !== "running") return { primary: "", secondary: "" };
+      // nowTick drives the re-render.
+      const elapsed = s.started ? Math.max(0, Math.floor(nowTick.value / 1000) - s.started) : null;
+      const done = s.done ?? 0;
+      // Linear extrapolation from THIS step's own rate — not a stored average
+      // from a previous run, which would be wrong on a first run and after any
+      // hardware or catalog change. Held back until a few units are done, or the
+      // first tick prints a wild number and then walks it back, which reads as
+      // less trustworthy than showing nothing.
+      const eta =
+        elapsed && s.total && done >= 5 && done < s.total
+          ? Math.round((elapsed / done) * (s.total - done))
+          : null;
+      const time = [elapsed != null ? fmtDuration(elapsed) : "", eta != null ? `~${fmtDuration(eta)} left` : ""]
+        .filter(Boolean)
+        .join(" · ");
+      // A step with no unit count has only its elapsed time, and that is the
+      // whole signal that it is alive — so it gets the primary slot rather than
+      // being dimmed into the secondary one.
+      return s.total != null
+        ? { primary: `${done.toLocaleString()} / ${s.total.toLocaleString()}`, secondary: time }
+        : { primary: time, secondary: "" };
+    })(),
   }));
 });
 
@@ -365,7 +411,7 @@ async function doStartExtract() {
   extractBusy.value = true;
   try {
     await startExtractJob();
-    emit("notify", "Extraction job started — expect it to run for a long while.", "success");
+    emit("notify", tr("inventory.admin.extract.started", "Extraction job started — expect it to run for a long while."), "success");
     await refreshExtractStatus();
   } catch (e) {
     fail(e);
@@ -730,13 +776,21 @@ const BTN_DANGER =
                     </span>
                   </div>
                 </div>
-                <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache()">
-                  <Loader2 v-if="cacheBusy" class="h-3.5 w-3.5 animate-spin" /><Trash2 v-else class="h-3.5 w-3.5" />
-                  Clear renders
-                </button>
+                <div class="flex flex-wrap gap-2">
+                  <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache('renders')">
+                    <Loader2 v-if="cacheBusy" class="h-3.5 w-3.5 animate-spin" /><Trash2 v-else class="h-3.5 w-3.5" />
+                    Clear renders
+                  </button>
+                  <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache('composites')">
+                    <Loader2 v-if="cacheBusy" class="h-3.5 w-3.5 animate-spin" /><Trash2 v-else class="h-3.5 w-3.5" />
+                    Clear composites
+                  </button>
+                </div>
                 <p class="text-xs text-muted-foreground">
                   Clearing forces every card to re-bake — the go-to move after a rendering fix, so stale
-                  bakes can't hide it.
+                  bakes can't hide it. Composites normally look after themselves (a shader change gives
+                  them a new generation, and the oldest are trimmed to stay under the size cap), so
+                  clearing them is only for reclaiming disk now rather than later.
                 </p>
               </div>
 
@@ -1246,11 +1300,19 @@ const BTN_DANGER =
                         }"
                       >{{ s.label }}</span>
                       <span
-                        v-if="s.detail"
-                        class="flex-none font-mono text-xs tabular-nums"
-                        :class="s.state === 'running' ? 'text-[hsl(var(--tac-amber))]' : 'text-muted-foreground/70'"
+                        v-if="s.primary || s.secondary"
+                        class="flex flex-none items-baseline gap-2 font-mono text-xs tabular-nums"
                       >
-                        {{ s.detail }}
+                        <span
+                          v-if="s.primary"
+                          :class="s.state === 'running' ? 'text-[hsl(var(--tac-amber))]' : 'text-muted-foreground/70'"
+                          >{{ s.primary }}</span
+                        >
+                        <!-- Timing sits a rank down: it answers "how much
+                             longer", which you only read once the count has told
+                             you where you are. Dimmer and [10px] so the two
+                             don't compete at a glance. -->
+                        <span v-if="s.secondary" class="text-[10px] text-muted-foreground/60">{{ s.secondary }}</span>
                       </span>
                     </div>
                     <!-- Only the running step gets a bar. An indeterminate one

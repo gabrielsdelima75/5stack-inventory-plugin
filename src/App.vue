@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch, provide, type ComputedRef } from "vue";
 import { cn } from "@5stack/ui";
+import en from "./locales/en.json";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -70,9 +71,11 @@ import TileActions from "./TileActions.vue";
 import FilterDropdown from "./FilterDropdown.vue";
 import InfiniteSentinel from "./InfiniteSentinel.vue";
 import SortDirection from "./SortDirection.vue";
+import ViewerControls from "./ViewerControls.vue";
 import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
 import { attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, wearTier } from "./itemVisuals";
-import { isCompact, isCoarse } from "./responsive";
+import { isCompact, isCoarse, reducedMotion } from "./responsive";
+import { revealInScroller } from "./dom";
 import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import "./style.css";
 
@@ -81,6 +84,32 @@ import "./style.css";
 // router falls back to the History API.
 interface Props extends HostRouting {
   user?: { steam_id: string; name: string; role: string } | null;
+  /**
+   * The host's toast, handed down the same way `navigate` is.
+   *
+   * REQUIRED, unlike the routing props. There is deliberately no fallback: a
+   * second, hand-rolled toast is a second thing to keep looking and behaving
+   * like the panel's, and it only ever rendered when embedded under a host too
+   * old to pass this. Standalone dev supplies its own in main.ts.
+   *
+   * It cannot be imported — a federated remote is a separate module graph, and
+   * `useToast` keeps its state in module scope, so an imported copy would push
+   * onto a toast list nothing renders.
+   */
+  notify: (message: string, kind: "error" | "success") => void;
+  /**
+   * The host's translator, and the locale it is currently resolving against.
+   *
+   * Same reasoning as `notify`: a federated remote has its own module graph, so
+   * it cannot reach the host's vue-i18n instance by importing it. Both optional
+   * — standalone and older hosts fall back to the built-in English.
+   *
+   * `locale` is passed as well as `t` so a language switch actually re-renders:
+   * `t` is a stable function reference, so nothing depending only on it would
+   * invalidate. Read it (see `tr`) to make a computed reactive to the switch.
+   */
+  t?: (key: string, named?: Record<string, unknown>) => string;
+  locale?: string;
 }
 const props = defineProps<Props>();
 const router = usePluginRouter(props);
@@ -92,8 +121,6 @@ const loadout = ref<LoadoutEntry[]>([]);
 const inventory = ref<InventoryItem[]>([]);
 const loading = ref(true);
 const error = ref(""); // fatal (initial load) error — shows a retry screen
-const notice = ref(""); // transient toast — never breaks the UI
-const noticeKind = ref<"error" | "success">("error");
 // Viewer mode: ?player=<steam64> shows that player's loadout read-only. The
 // query is host-owned now, so a back/forward between two shared links reloads
 // into the right player instead of stranding the old one on screen.
@@ -798,12 +825,41 @@ const replaceOptions = computed(() => {
 });
 
 // ---- mutations --------------------------------------------------------------
-let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Translate `key`: our catalogue first, the panel second, `fallback` last.
+ *
+ * OURS wins deliberately. The panel ships its own messages and an operator
+ * upgrading it must not be able to silently change this plugin's wording, so a
+ * key we define is the one that renders. The panel is consulted only for keys
+ * we do not own.
+ *
+ * Two distinct misses to survive, and vue-i18n conflates them: no host `t` at
+ * all (standalone), and a host `t` that does not know the key — vue-i18n
+ * returns the KEY itself for an unknown message, so without the comparison
+ * below `inventory.foo.bar` would render on screen.
+ *
+ * Reads `props.locale` so anything computed from this re-evaluates on a
+ * language switch — `props.t` is a stable reference and would not trigger it.
+ */
+const CATALOGUES: Record<string, Record<string, unknown>> = { en };
+function lookup(catalogue: Record<string, unknown>, key: string): unknown {
+  return key.split(".").reduce<unknown>((o, k) => (o as Record<string, unknown>)?.[k], catalogue);
+}
+function tr(key: string, fallback: string, named?: Record<string, unknown>): string {
+  const lang = props.locale ?? "en";
+  const mine = lookup(CATALOGUES[lang] ?? {}, key) ?? lookup(CATALOGUES.en, key);
+  if (typeof mine === "string") {
+    return mine.replace(/\{(\w+)\}/g, (_, k) => String(named?.[k] ?? `{${k}}`));
+  }
+  const host = props.t?.(key, named);
+  return !host || host === key ? fallback : host;
+}
+
+/** Every notification in the plugin funnels through here — including the ones
+ *  AdminConsole and SkinTests emit upward — so the host's toast is the single
+ *  implementation. */
 function notify(message: string, kind: "error" | "success" = "error") {
-  notice.value = message;
-  noticeKind.value = kind;
-  clearTimeout(noticeTimer);
-  noticeTimer = setTimeout(() => (notice.value = ""), 5000);
+  props.notify(message, kind);
 }
 function fail(e: unknown) {
   notify(e instanceof Error ? e.message : String(e), "error");
@@ -1130,7 +1186,7 @@ async function restoreDraftRoute(skinId: number) {
     const byId = new Map(items.map((i) => [i.id, i]));
     const skin = byId.get(skinId);
     if (!skin) {
-      notify("That craft link points at an item that no longer exists.", "error");
+      notify(tr("inventory.notify.craft_link_missing", "That craft link points at an item that no longer exists."), "error");
       go("/items");
       return;
     }
@@ -1351,7 +1407,7 @@ async function openCraftInspect() {
  */
 async function duplicateCraft() {
   if (!craft.value || craftBusy.value) return;
-  if (!signedIn.value) return notify("Sign in to save this to your inventory.");
+  if (!signedIn.value) return notify(tr("inventory.notify.sign_in_to_save", "Sign in to save this to your inventory."));
   editingId.value = null;
   duplicating.value = true;
   await confirmCraft();
@@ -1361,7 +1417,7 @@ async function confirmCraft() {
   // Belt-and-braces behind the disabled button: the editor is reachable signed
   // out (and via a shared /craft/<id> draft link), so the commit re-checks
   // rather than trusting that no path got here.
-  if (!signedIn.value) return notify("Sign in to save this to your inventory.");
+  if (!signedIn.value) return notify(tr("inventory.notify.sign_in_to_save", "Sign in to save this to your inventory."));
   craftBusy.value = true;
   try {
     const body = craftBody();
@@ -1410,7 +1466,9 @@ async function confirmCraft() {
       // craft was lost. Equipping is one click from the inventory; a failed
       // save is not recoverable.
       notify(
-        duplicating.value ? "Editable copy created in your inventory." : "Crafted — it's in your inventory.",
+        duplicating.value
+          ? tr("inventory.notify.copy_created", "Editable copy created in your inventory.")
+          : tr("inventory.notify.crafted", "Crafted — it's in your inventory."),
         "success",
       );
       sheetMode.value = "owned";
@@ -1522,14 +1580,17 @@ async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
     const up = await uploadRender(inst.id, blob);
     if (!up.ok && !uploadWarned) {
       uploadWarned = true;
-      notify(`Render made locally, but saving it failed: ${up.error}. Check backend deploy/mount.`, "error");
+      notify(tr("inventory.notify.render_upload_failed",
+        `Render made locally, but saving it failed: ${up.error}. Check backend deploy/mount.`,
+        { error: up.error }), "error");
     } else if (up.ok && !uploadWarned) {
       // Verify the file actually serves back — if not, the backend wrote to a
       // mount nginx can't see (or a CDN cached the old 404).
       if (!(await renderServes(`${renderUrlFor(inst)}?verify=${Date.now()}`))) {
         uploadWarned = true;
         notify(
-          "Render SAVED (backend OK) but /renders/ doesn't serve it back — frontend + backend pods aren't sharing the mount, or a cache is serving a stale 404.",
+          tr("inventory.notify.render_not_served",
+            "Render SAVED (backend OK) but /renders/ doesn't serve it back — frontend + backend pods aren't sharing the mount, or a cache is serving a stale 404."),
           "error",
         );
       }
@@ -1573,6 +1634,10 @@ function onRenderError(e: Event, i: InventoryItem) {
 // source. (Must be provided AFTER the consts exist — script-setup runs
 // top-to-bottom.)
 provide("itemArt", { renderSrc, onRenderError, renderingIds, queuedIds, assetsPending });
+// Child components translate through the same resolver — one catalogue, one
+// resolution order. Provided rather than passed as a prop because it is needed
+// at every depth and threading it through each component adds nothing.
+provide("tr", tr);
 
 // 3D preview inside the craft/edit modal.
 const modal3d = ref(false);
@@ -2046,6 +2111,30 @@ async function refreshCraftPreview() {
     if (token === craftPreviewToken) craftPreviewBusy.value = false;
   }
 }
+// NOT baked while the modal is showing 3D — the image it produces is
+// `v-show="!modal3d"`, i.e. hidden behind the live viewer.
+//
+// A bake mounts a SECOND WebGL context, loads the model and composites the paint:
+// about a second of GPU and main thread, competing with the viewer the user is
+// actually looking at. It fires off a 400ms debounce, so every sticker you added
+// and every pause mid-drag to line one up bought a stall in the 3D view — for a
+// picture nobody could see. Deferred to the moment 3D is switched off instead.
+let craftPreviewStale = false;
+function scheduleCraftPreview(ms: number) {
+  clearTimeout(craftPreviewTimer);
+  if (modal3d.value) {
+    craftPreviewStale = true;
+    return;
+  }
+  craftPreviewTimer = setTimeout(() => void refreshCraftPreview(), ms);
+}
+// Leaving 3D is when that deferred bake comes due — the 2D image is about to be
+// the thing on screen, so it has to catch up on everything edited while hidden.
+watch(modal3d, (on) => {
+  if (on || !craftPreviewStale) return;
+  craftPreviewStale = false;
+  scheduleCraftPreview(0);
+});
 watch(
   // must match craftStateJson exactly — the baseline compare below is what
   // decides whether the already-baked render still stands
@@ -2061,7 +2150,7 @@ watch(
       return;
     }
     if (v === craftBaseline) return; // unchanged since open — stored render stands
-    craftPreviewTimer = setTimeout(() => void refreshCraftPreview(), 400);
+    scheduleCraftPreview(400);
   },
 );
 
@@ -2723,6 +2812,105 @@ function resetSheetFilters() {
   sheetSort.value = DEFAULT_SORT;
 }
 
+// ---- desktop: the lifting picker sheet --------------------------------------
+// The picker used to be a fixed 34vh strip below the loadout. Browsing skins in
+// it is cramped, and the only lever for more room — shrinking the loadout —
+// reflows three column scrollers and squeezes every slot card down to its
+// min-height.
+//
+// So on desktop the sheet comes OUT OF FLOW and floats over the loadout. The
+// loadout half reserves the collapsed height as padding and then never moves
+// again: lifting changes nothing but the sheet's own height, which also means
+// the 3D canvas up there never gets resized by a lift. The cost is occlusion —
+// the slot you're editing can end up underneath — and `revealSelectedSlot`
+// below is what pays it off.
+//
+// Explicitly toggled, never automatic. An earlier build raised it on pointer-in
+// and lowered it on pointer-out, which read as the panel deciding things on its
+// own — a half-second of hesitation over the wrong pixel resized the screen.
+//
+// Compact keeps its drag-to-snap sheet; none of this applies there.
+const SHEET_COLLAPSED_MIN = 210; // was min-h-[210px]
+const SHEET_COLLAPSED_VH = 34; // was h-[34vh]
+const SHEET_LIFT_PCT = 60; // of the loadout column, NOT of the viewport
+const SHEET_LIFT_MS = 240; // height transition; the reveal below waits it out
+// A little more scroll range than the sheet actually covers, so the LAST slot
+// in a column can sit clear of its top edge instead of flush against it.
+const LIFT_SPACER_PAD = 12;
+const SHEET_COLLAPSED_CSS = `max(${SHEET_COLLAPSED_MIN}px, ${SHEET_COLLAPSED_VH}vh)`;
+
+const sheetLift = ref(localStorage.getItem("cs2inv.sheetLift") === "1");
+watch(sheetLift, (v) => localStorage.setItem("cs2inv.sheetLift", v ? "1" : "0"));
+
+// The sheet only floats on desktop, and only when it's on screen at all — the
+// 3D viewer route replaces it entirely (`v-if="!viewerId"`), and reserving
+// space for a sheet that isn't rendered would leave a dead strip.
+const canLift = computed(() => !isCompact.value && !viewerId.value);
+const lifted = computed(() => canLift.value && sheetLift.value);
+
+const loadoutEl = ref<HTMLElement | null>(null);
+const loadoutH = ref(0);
+const viewportH = ref(typeof window === "undefined" ? 0 : window.innerHeight);
+// Collapsed height stays viewport-derived (that's what 34vh meant) while the
+// lifted one is a fraction of the loadout column, so CSS can resolve both on
+// its own. Only their DIFFERENCE has to be a real number here, because that's
+// how far the sheet reaches over the loadout — the band the slot columns have
+// to be able to scroll out from under.
+const collapsedPx = computed(() => Math.max(SHEET_COLLAPSED_MIN, (SHEET_COLLAPSED_VH / 100) * viewportH.value));
+const liftIntrusion = computed(() =>
+  lifted.value ? Math.max(0, Math.round((loadoutH.value * SHEET_LIFT_PCT) / 100 - collapsedPx.value)) : 0,
+);
+
+// Reserved on the loadout side so the collapsed layout is exactly what it was
+// when the sheet still took its space in flow.
+const loadoutPadStyle = computed(() => (canLift.value ? { paddingBottom: SHEET_COLLAPSED_CSS } : {}));
+// Every loadout scroller gets the same pair: a spacer in the template gives it
+// somewhere to scroll TO, and scroll-padding keeps browser-driven scrolls (tab
+// focus, mostly) from landing under the sheet.
+const liftScrollStyle = computed(() => (liftIntrusion.value ? { scrollPaddingBottom: `${liftIntrusion.value}px` } : {}));
+
+// The whole point of the reserve above: with the sheet lifted, the slot being
+// edited has to stay visible in the strip that's left. Every loadout scroller
+// carries a spacer exactly `liftIntrusion` tall while lifted, so there is
+// always a scroll position that clears the sheet.
+async function revealSelectedSlot(smooth = true) {
+  if (!lifted.value || view.value !== "grid") return;
+  await nextTick(); // the spacer has to be in the DOM before there's anywhere to go
+  const el = loadoutEl.value?.querySelector<HTMLElement>(`[data-slot="${CSS.escape(selected.value)}"]`);
+  if (!el) return;
+  const inset = liftIntrusion.value;
+  // Two passes, and the second is the one that's actually load-bearing. A
+  // scroll issued while the sheet is still animating its own height lands
+  // short — measured ~50px shy — and on the toggle-up that starts it the
+  // scroller may not even have the range yet, making the first pass a silent
+  // no-op. The settle pass runs once the transition is over and is itself a
+  // no-op whenever the first one already arrived.
+  revealInScroller(el, inset, smooth && !reducedMotion.value);
+  clearTimeout(revealSettleTimer);
+  revealSettleTimer = setTimeout(() => revealInScroller(el, inset, false), SHEET_LIFT_MS + 80);
+}
+let revealSettleTimer: ReturnType<typeof setTimeout> | undefined;
+// liftIntrusion is in here for the resize case: the free strip changes size and
+// what used to be visible may not be any more.
+watch([lifted, selected, liftIntrusion], () => void revealSelectedSlot());
+
+let loadoutRO: ResizeObserver | null = null;
+// The loadout column mounts and unmounts with the view swap, so the observer
+// follows the ref rather than being set up once. It also stands in for a
+// window resize listener — this element is sized off the viewport, so anything
+// that changes the viewport changes it.
+watch(loadoutEl, (el) => {
+  loadoutRO?.disconnect();
+  loadoutRO = null;
+  if (!el || typeof ResizeObserver === "undefined") return;
+  loadoutH.value = el.clientHeight;
+  loadoutRO = new ResizeObserver(() => {
+    loadoutH.value = el.clientHeight;
+    viewportH.value = window.innerHeight;
+  });
+  loadoutRO.observe(el);
+});
+
 // The default snap reserves exactly two rows of slot cards — four skins — and
 // the fifth scrolls. Expressed as a PIXEL reserve, not a screen fraction: a
 // fraction that shows two rows on a 800px phone shows four on a 1180px one,
@@ -2749,7 +2937,17 @@ const sheetDragPx = ref<number | null>(null);
 let sheetDrag: { y: number; h: number; max: number; moved: boolean } | null = null;
 
 const sheetStyle = computed(() => {
-  if (!isCompact.value) return {};
+  if (!isCompact.value) {
+    // Desktop: absolutely positioned, so the height IS the whole interaction.
+    // The percentage resolves against the loadout column, which is what makes
+    // "60% of the loadout area" mean that on every screen.
+    return {
+      height: lifted.value ? `${SHEET_LIFT_PCT}%` : SHEET_COLLAPSED_CSS,
+      transition: reducedMotion.value ? "none" : `height ${SHEET_LIFT_MS}ms cubic-bezier(0.22,1,0.36,1)`,
+      // Reads as a layer above the loadout rather than a taller panel.
+      boxShadow: lifted.value ? "0 -18px 40px -22px hsl(var(--background))" : "none",
+    };
+  }
   const snap = sheetSnap.value;
   const height =
     sheetDragPx.value != null
@@ -3490,6 +3688,8 @@ onBeforeUnmount(() => {
   clearInterval(buildTimer);
   clearTimeout(pulseTimer);
   clearTimeout(pendingDeleteTimer);
+  clearTimeout(revealSettleTimer);
+  loadoutRO?.disconnect();
   // Don't let unmount abandon a staged delete — fire the API calls now.
   const batch = pendingDelete.value;
   if (batch) {
@@ -3580,6 +3780,11 @@ function onGlobalKey(e: KeyboardEvent) {
     } else if (craft.value) {
       closeCraft();
       e.stopPropagation();
+    } else if (lifted.value) {
+      // Topmost non-modal layer: it's covering the loadout, so it's what
+      // Escape should get you out from under.
+      sheetLift.value = false;
+      e.stopPropagation();
     } else if (view.value === "focus") {
       go("/");
     }
@@ -3658,6 +3863,9 @@ onMounted(() => {
   nextTick(syncAllPills);
   setTimeout(syncAllPills, 120);
   window.addEventListener("resize", syncAllPills);
+  // Loading straight into a remembered lift never trips the watcher below, so
+  // the slot a deep link selected would start out under the sheet.
+  void revealSelectedSlot(false);
 });
 
 // The host may resolve the session after we mount, handing `user` down late. We
@@ -3814,10 +4022,20 @@ async function runSteamImport() {
       removed && `${removed} no longer owned`,
       skipped && `${skipped} skipped`,
     ].filter(Boolean);
+    const summary = parts.join(" · ");
     notify(
       parts.length
-        ? `Synced with Steam — ${parts.join(" · ")}.${partial ? " Inventory too large to read fully." : ""}`
-        : "Synced with Steam — everything was already up to date.",
+        ? partial
+          ? tr(
+              "inventory.notify.synced_partial",
+              `Synced with Steam — ${summary}. Inventory too large to read fully.`,
+              { summary },
+            )
+          : tr("inventory.notify.synced", `Synced with Steam — ${summary}.`, { summary })
+        : tr(
+            "inventory.notify.synced_no_changes",
+            "Synced with Steam — everything was already up to date.",
+          ),
       "success",
     );
   } catch (e) {
@@ -3951,13 +4169,30 @@ if (MDEBUG) {
   <!-- data-5stack-plugin anchors the design system's scoping (utilities + base
        rules); data-cs2-inventory scopes this plugin's own CSS in style.css. -->
   <div data-5stack-plugin data-cs2-inventory style="display: contents">
+  <!-- Full-bleed wrapper: cancels the host's p-1/sm:p-4 on the left, right and
+       bottom, and owns an opaque background.
+       The lifting picker sheet HAS to paint an opaque surface (it covers the
+       loadout), and the moment anything in here is opaque the host's padding
+       stops reading as page margin and starts reading as a gap between the
+       panel and the window edge — most obviously down the right side with the
+       friends list open. Top is deliberately left alone: that edge sits under
+       the breadcrumb and wants the breathing room.
+       Separate from the sizing div below so `mx-auto` there still centres the
+       app inside its max width on wide monitors — negative margins would
+       cancel the auto. -->
+  <div class="-mx-1 -mb-1 flex min-w-0 flex-1 flex-col bg-background sm:-mx-4 sm:-mb-4">
   <div
     class="mx-auto flex w-full max-w-[1560px] flex-col overflow-hidden text-foreground"
     :class="[
       // Embedded we're one tab among several on a page that scrolls itself, so
       // 100dvh would push the rest of the profile off-screen. Take a bounded
       // slice instead and let the host own the page scroll.
-      embedMode ? 'h-[70dvh] min-h-[480px]' : 'h-[calc(100dvh-6rem)]',
+      //
+      // The +0.25/+1rem is the host padding the wrapper above bleeds over: the
+      // negative margin lets us paint there, but this height is fixed, so
+      // without matching it the app would just stop 16px short and leave the
+      // gap along the bottom edge. Keep the two in step.
+      embedMode ? 'h-[70dvh] min-h-[480px]' : 'h-[calc(100dvh-6rem+0.25rem)] sm:h-[calc(100dvh-6rem+1rem)]',
       !isCompact && !embedMode && 'min-h-[560px]',
     ]"
     :data-team="team"
@@ -4260,11 +4495,11 @@ if (MDEBUG) {
               v-for="f in ORIGIN_FILTERS"
               :key="f[0]"
               :ref="(el) => invOriginPill.setRef(f[0], el)"
-              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
               :class="invOrigin === f[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="invOrigin = f[0]"
             >
-              <RefreshCw v-if="f[0] === 'steam'" class="h-3 w-3" :style="{ color: STEAM_BLUE }" />{{ f[1] }}
+              {{ f[1] }}
             </button>
           </div>
           <FilterDropdown
@@ -4459,10 +4694,21 @@ if (MDEBUG) {
       </div>
 
       <!-- ============ LOADOUT / FOCUS ============ -->
-      <div v-else key="loadout" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <!-- `relative` makes this the containing block for the desktop picker
+           sheet, which floats over the loadout instead of sitting under it; the
+           existing overflow-hidden then clips it to the loadout area. -->
+      <div v-else ref="loadoutEl" key="loadout" class="relative flex min-h-0 flex-1 flex-col overflow-hidden">
       <!-- Stacks on compact so the focus rail can sit above the stage as a
-           strip rather than beside it as a fixed 122px column. -->
-      <div class="relative flex min-h-0 flex-1 overflow-hidden" :class="isCompact && 'flex-col'">
+           strip rather than beside it as a fixed 122px column.
+           The padding is the space the sheet used to occupy in flow: reserving
+           it here means the collapsed layout is unchanged and a lift moves
+           nothing but the sheet. -->
+      <!-- `isolate` keeps this half's z-indexes to itself — the focus-view 3D
+           cursor overlay sits at z-20 and would otherwise punch up through the
+           lifted sheet. With a stacking context here the sheet only has to
+           out-rank one element, so it can stay at a low enough z to lose to the
+           host's drawers. -->
+      <div class="relative isolate flex min-h-0 flex-1 overflow-hidden" :class="isCompact && 'flex-col'" :style="loadoutPadStyle">
         <!-- Slot rail (focus view only): the WHOLE loadout, mini. This is the
              only navigation focus mode needs — no strip under the stage. -->
         <nav
@@ -4658,7 +4904,13 @@ if (MDEBUG) {
         <!-- ============ LOADOUT GRID ============ -->
         <template v-else-if="view === 'grid'">
           <!-- Identity column: gloves + knife (prominent) and a compact agent -->
-          <aside class="animate-grid-in flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col gap-2.5 overflow-y-auto py-3 pl-4 pr-1">
+          <!-- The inner wrapper exists so the lift spacer can be a SIBLING of
+               the cards rather than padding on the scroller: padding would come
+               out of the flex line and squeeze every flex-1 card toward its
+               min-height, which is the reflow the floating sheet exists to
+               avoid. min-h-full keeps the cards stretching exactly as before. -->
+          <aside class="animate-grid-in flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col overflow-y-auto py-3 pl-4 pr-1" :style="liftScrollStyle">
+            <div class="flex min-h-full flex-col gap-2.5">
             <div class="px-1 text-f9 uppercase tracking-cs3 text-muted-foreground/70">Equipment</div>
             <button
               v-for="(s, si) in [RAIL[2], RAIL[1]]"
@@ -4784,6 +5036,8 @@ if (MDEBUG) {
                 <div class="relative z-[2] w-full truncate text-center text-f8 uppercase tracking-cs1 text-muted-foreground/70">{{ s.name }}</div>
               </button>
             </div>
+            </div>
+            <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
           </aside>
 
           <!-- Positional weapon columns (CS2: 5 slots each) -->
@@ -4798,7 +5052,12 @@ if (MDEBUG) {
                 <span class="text-f11 font-semibold uppercase tracking-cs2 text-muted-foreground">{{ g.label }}</span>
                 <span class="ml-auto font-mono text-f9 text-muted-foreground/60">{{ g.skinned }}/{{ g.positions.length }}</span>
               </header>
-              <div class="flex flex-1 flex-col gap-2 overflow-y-auto pt-2">
+              <!-- Wrapper + spacer, same shape as the identity column: the
+                   spacer is what gives this scroller somewhere to scroll when
+                   the lifted sheet is covering its bottom, without padding
+                   stealing height from the flex-1 cells. -->
+              <div class="flex flex-1 flex-col overflow-y-auto pt-2" :style="liftScrollStyle">
+                <div class="flex min-h-full flex-col gap-2">
                 <!-- Every pos-derived display below reads through
                      previewPos(): during a reorder hover the two cells render
                      each other's contents — the drop confirms what you see. -->
@@ -4902,6 +5161,8 @@ if (MDEBUG) {
                     />
                   </div>
                 </button>
+                </div>
+                <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
               </div>
             </section>
           </div>
@@ -5042,12 +5303,14 @@ if (MDEBUG) {
               >
                 Report a problem
               </a>
-              <span
+              <!-- Camera legend. Floats over the canvas at the bottom edge, where
+                   the model almost never is, and sits at 70% until hovered so it
+                   reads as chrome rather than as part of the item. -->
+              <ViewerControls
                 v-if="focus3d && !focus3dBusy"
-                class="pointer-events-none absolute bottom-1 left-1/2 z-[3] -translate-x-1/2 text-f9 uppercase tracking-cs2 text-muted-foreground/50"
-              >
-                {{ isCoarse ? 'drag to rotate · pinch to zoom · two fingers to pan' : 'drag to rotate · scroll to zoom · right-drag to pan' }}
-              </span>
+                variant="overlay"
+                class="absolute bottom-1 left-1/2 z-[3] -translate-x-1/2"
+              />
             </div>
 
             <div class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5">
@@ -5092,11 +5355,15 @@ if (MDEBUG) {
       </div>
 
       <!-- ============ BOTTOM SHEET ============ -->
+      <!-- z-[5]: high enough to clear the loadout half (isolated above, so its
+           internals can't reach up here), low enough to stay UNDER the host
+           panel's own chrome — the notifications and friends drawers are fixed
+           at z-10, and at z-40 this sheet painted straight over them. -->
       <section
         v-if="!viewerId"
         data-role="picker-sheet"
-        class="flex flex-none flex-col border-t border-border"
-        :class="isCompact ? 'min-h-0' : 'h-[34vh] min-h-[210px]'"
+        class="flex flex-col border-t border-border"
+        :class="isCompact ? 'min-h-0 flex-none' : 'absolute inset-x-0 bottom-0 z-[5] bg-background'"
         :style="sheetStyle"
       >
         <!-- Grab handle: the only affordance telling a touch user this panel
@@ -5111,9 +5378,13 @@ if (MDEBUG) {
         >
           <span class="h-1 w-10 rounded-full bg-muted-foreground/40"></span>
         </div>
+        <!-- Desktop never wraps. A second row here costs ~40px of picker for one
+             input, and it appears and disappears as you switch modes (Replace
+             drops the rarity/sort controls), so the grid below jumps. The search
+             box absorbs the pressure by shrinking instead. -->
         <div
-          class="flex flex-wrap items-center border-b border-border"
-          :class="isCompact ? 'gap-2 px-3 py-2' : 'gap-2.5 px-6 py-2.5'"
+          class="flex items-center border-b border-border"
+          :class="isCompact ? 'flex-wrap gap-2 px-3 py-2' : 'gap-2.5 px-6 py-2.5'"
         >
           <!-- Sheet-mode tabs: same sliding pill as the view tabs, pinned first
                so nothing in this row ever jumps around. Stays auto-width at
@@ -5148,19 +5419,23 @@ if (MDEBUG) {
             <button
               v-if="isWeaponPos(selected)"
               :ref="(el) => sheetPill.setRef('replace', el)"
-              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetMode === 'replace' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="sheetMode = 'replace'"
             >
-              <Replace class="h-3 w-3" /> Replace
+              Replace
             </button>
+            <!-- Text only. These are three tabs in one pill with the sliding
+                 indicator already saying which is active; the glyphs were
+                 spending ~60px of the row on decoration, and that was the
+                 difference between the search box fitting and wrapping. -->
             <button
               :ref="(el) => sheetPill.setRef('craft', el)"
-              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetMode === 'craft' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="sheetMode = 'craft'"
             >
-              <Hammer class="h-3 w-3 text-[hsl(var(--tac-amber,33_94%_58%))]" /> Craft
+              Craft
             </button>
           </div>
           <!-- Rarity filter: ranks show their colors, ordered least → greatest. -->
@@ -5207,11 +5482,11 @@ if (MDEBUG) {
               v-for="f in ORIGIN_FILTERS"
               :key="f[0]"
               :ref="(el) => sheetOriginPill.setRef(f[0], el)"
-              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetOrigin === f[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="sheetOrigin = f[0]"
             >
-              <RefreshCw v-if="f[0] === 'steam'" class="h-3 w-3" :style="{ color: STEAM_BLUE }" />{{ f[1] }}
+              {{ f[1] }}
             </button>
           </div>
           <!-- No weapon name here: the cards below all show it, and at ~220px of
@@ -5225,7 +5500,7 @@ if (MDEBUG) {
           <!-- Compact moves search into the filter sheet: sharing the row with
                the tabs left it ~99px wide and pushed the filter chip onto a
                line of its own, spending 40px to show one button. -->
-          <div v-if="!isCompact" class="relative w-[220px] flex-none">
+          <div v-if="!isCompact" class="relative w-[220px] min-w-[128px] shrink">
             <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <input
               ref="sheetSearchEl"
@@ -5240,6 +5515,18 @@ if (MDEBUG) {
               @click="sheetSearch = ''; sheetSearchEl?.focus()"
             ><X class="h-3.5 w-3.5" /></button>
           </div>
+          <!-- The only way in or out of the lift, and it stays put across
+               sessions: the panel changes size when you ask it to and at no
+               other time. -->
+          <button
+            v-if="canLift"
+            class="grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            :title="sheetLift ? 'Lower the picker' : 'Raise the picker over the loadout'"
+            :aria-expanded="sheetLift"
+            @click="sheetLift = !sheetLift"
+          >
+            <ChevronUp class="h-4 w-4 transition-transform duration-200" :class="sheetLift && 'rotate-180'" />
+          </button>
           <!-- Compact-only disclosure for rarity/sort/origin. Badged so a
                filter left on somewhere out of sight is still visible. -->
           <!-- Owns search as well as the filters on compact, so it shows in
@@ -5373,12 +5660,12 @@ if (MDEBUG) {
                   <button
                     v-for="f in ORIGIN_FILTERS"
                     :key="f[0]"
-                    class="flex items-center gap-1.5 rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors"
+                    class="flex items-center rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors"
                     :class="sheetOrigin === f[0] ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground'"
                     :style="sheetOrigin === f[0] ? { background: accentSoft } : {}"
                     @click="sheetOrigin = f[0]"
                   >
-                    <RefreshCw v-if="f[0] === 'steam'" class="h-3 w-3" :style="{ color: STEAM_BLUE }" />{{ f[1] }}
+                    {{ f[1] }}
                   </button>
                 </div>
               </section>
@@ -5750,26 +6037,12 @@ if (MDEBUG) {
               <!-- Controls legend. Overlaying the model put it on top of the
                    thing being dragged; on the footer baseline it sits out of the
                    way but still in eyeline. -->
-              <div
+              <ViewerControls
                 v-if="modal3d"
-                class="col-start-3 flex flex-col gap-1 justify-self-end rounded-md border border-border/60 bg-background/80 px-2.5 py-2"
-              >
-                <div v-if="!viewOnly" class="flex items-center gap-2">
-                  <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">drag</kbd>
-                  <span class="text-f9 text-muted-foreground">move sticker or charm</span>
-                </div>
-                <div class="flex items-center gap-2">
-                  <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">{{ isCoarse ? '2 fingers' : 'right-drag' }}</kbd>
-                  <span class="text-f9 text-muted-foreground">{{ viewOnly ? 'pan · scroll to zoom' : 'pan · zoom in for fine placement' }}</span>
-                </div>
-                <!-- Touch has no shift key, so this shortcut is unreachable there.
-                     Rotation is still available via the sticker's numeric field —
-                     only the hint is hidden, not the capability. -->
-                <div v-if="craft.stickers.some(Boolean) && !isCoarse && !viewOnly" class="flex items-center gap-2">
-                  <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">shift</kbd>
-                  <span class="text-f9 text-muted-foreground">+ drag to rotate</span>
-                </div>
-              </div>
+                class="col-start-3 justify-self-end"
+                :edit="!viewOnly"
+                :rotate="craft.stickers.some(Boolean)"
+              />
             </div>
           </div>
           <!-- Options (edit) / spec (view). Same column, same boxes, same
@@ -6244,24 +6517,6 @@ if (MDEBUG) {
     </Transition>
 
     <!-- Transient action error (never breaks the app) -->
-    <Transition
-      enter-active-class="transition duration-200"
-      enter-from-class="opacity-0 translate-y-2"
-      leave-active-class="transition duration-150"
-      leave-to-class="opacity-0 translate-y-2"
-    >
-    <div
-      v-if="notice"
-      class="fixed left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-3 rounded-md border bg-card px-4 py-2.5 text-f13 shadow-2xl"
-      :class="[
-        noticeKind === 'success' ? 'border-[color:var(--acc)]' : 'border-destructive/50',
-        pendingDelete ? 'bottom-16' : 'bottom-5',
-      ]"
-    >
-      <span :class="noticeKind === 'success' ? 'text-foreground' : 'text-destructive'">{{ notice }}</span>
-      <button class="text-muted-foreground transition-colors hover:text-foreground" @click="notice = ''">✕</button>
-    </div>
-    </Transition>
 
     <!-- Staged delete: the item is already out of the list; this is the 6s
          window in which that decision can be taken back. -->
@@ -6524,6 +6779,7 @@ if (MDEBUG) {
       </div>
     </div>
     </Transition>
+  </div>
   </div>
   </div>
 </template>

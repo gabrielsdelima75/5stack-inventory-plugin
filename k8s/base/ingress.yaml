@@ -19,6 +19,17 @@ kind: Ingress
 metadata:
   name: inventory-api
   namespace: 5stack
+  annotations:
+    # ingress-nginx defaults to a 1MB request body, and without this the shared
+    # paint composites (src/compositeStore.ts) are rejected with a 413 that never
+    # reaches the backend — a lossless 2k albedo+rough/metal pair is a few MB,
+    # and a 4k projected style more. MEASURED against this ingress: 0.5MB
+    # reached the backend, 1.5MB returned 413.
+    #
+    # Card renders (~100KB) always fit, which is why the limit went unnoticed.
+    # The backend caps the body itself per route (COMPOSITE_MAX_BYTES), so this
+    # is the outer bound, not the only one.
+    nginx.ingress.kubernetes.io/proxy-body-size: 64m
 spec:
   ingressClassName: nginx
   rules:

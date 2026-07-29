@@ -19,6 +19,10 @@ const testsDir = process.env.TESTS_DIR ?? "/cs2-models/tests";
 // served here as well as in nginx.conf: the hot-swap deployment runs THIS file
 // rather than nginx, so an nginx-only route leaves every tile blank in dev.
 const imagesDir = process.env.IMAGES_DIR ?? "/cs2-models/images";
+// Shared paint composites, uploaded by clients (src/compositeStore.ts). Same
+// hot-swap reasoning as the icons above: without this route, dev clients never
+// see a cache hit and every 3D open pays the full ~38MB of composite inputs.
+const compositesDir = process.env.COMPOSITES_DIR ?? "/cs2-models/composites";
 // Production nginx falls back to the backend when a mount-backed path misses
 // (`try_files $uri @backend`), for the case where the frontend and backend pods
 // land on different nodes and only one of them can see the file. Mirror that
@@ -41,6 +45,10 @@ const MIME = {
 };
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
+  // Cross-origin resource timing reports 0 bytes without this, which made the
+  // viewer's ?perf=1 byte counter useless in dev — the panel and the plugin's
+  // assets are different origins. Mirrored in nginx.conf.
+  "Timing-Allow-Origin": "*",
   // Default: never cache. Right for the dev loop — dist/ is rebuilt constantly
   // and a cached bundle is the classic "my change did nothing".
   "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -61,10 +69,18 @@ const HEADERS = {
 const IMMUTABLE = "public, max-age=31536000, immutable";
 function cacheControlFor(base, pathname, query) {
   if (base === imagesDir) return IMMUTABLE;
+  // A composite's URL carries both the shader generation and the extraction
+  // version in its directory, so it is immutable outright — no stamp needed.
+  if (base === compositesDir) return IMMUTABLE;
   // Materials AND textures: both are only immutable once version-stamped. A
   // texture's filename hashes its archive PATH, not its bytes, so a CS2 update
   // can replace the contents behind an identical name.
-  if (base === paintsDir) return query.get("v") ? IMMUTABLE : "no-cache";
+  //
+  // MODELS are the same shape of problem and were missing from this list, which
+  // meant the biggest files in the whole pipeline (an AK's 4096-square textures
+  // plus the 38MB .inputs.hd bundle) were re-downloaded on every single page
+  // load in dev. Same rule, same fix.
+  if (base === paintsDir || base === modelsDir) return query.get("v") ? IMMUTABLE : "no-cache";
   return HEADERS["Cache-Control"];
 }
 
@@ -89,6 +105,9 @@ createServer(async (req, res) => {
     } else if (pathname.startsWith("/images/")) {
       base = imagesDir;
       pathname = pathname.slice("/images".length);
+    } else if (pathname.startsWith("/composites/")) {
+      base = compositesDir;
+      pathname = pathname.slice("/composites".length);
     }
     const file = normalize(join(base, pathname));
     if (!file.startsWith(base + sep) && file !== join(root, "index.html")) {

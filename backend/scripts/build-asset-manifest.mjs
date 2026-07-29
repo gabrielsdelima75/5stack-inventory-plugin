@@ -49,15 +49,26 @@ for (const item of CS2Economy.itemsAsArray) {
 
 // Types whose paint chain is actually COMPOSITED. Only these fetch a
 // paintMaterial: viewer3d passes one for the weapon being rendered, and the
-// skin-test suite covers weapon/knife/glove. Stickers and patches are drawn as
-// decals from their flat `image`, never from a paint material — see
-// StickerPlacement in viewer3d.ts, which carries an image and nothing else.
+// skin-test suite covers weapon/knife/glove.
 //
 // This filter is worth a lot. cs2-lib lists 12,044 paint materials but only
 // 1,479 belong to these types; following the other 10,565 dragged in 6,245
 // textures nothing ever requests — 76% of the texture work, and the paint step
 // was 71% of the whole extraction.
 const COMPOSITED_TYPES = new Set(["weapon", "melee", "glove"]);
+
+// Stickers and patches ride the same pipe but are NOT composited: the extractor
+// follows one texture out of their material and stops (see the sticker branch in
+// the graph walk), so the cost is ~3.2k textures rather than the 6,245 the full
+// chain would drag in.
+//
+// Why bother at all, when a sticker already has a flat `image`? Because that
+// image is the INVENTORY ICON, not the sticker: measured on Dystopian Gaze, the
+// icon is 512x384 with the art inset 11.5% at the sides, flush to the top and
+// 11.2% clear of the bottom, while the sticker's own material declares a 512x512
+// texture. Drawing the icon as a decal therefore squashed the art and hung it
+// above its own anchor. `g_tSticker0` is what the game actually draws.
+const DECAL_TYPES = new Set(["sticker", "patch"]);
 
 // Paint materials. `paintMaterial` is "/materials/<stem>_<hash8>.vcompmat.json"
 // (a few are .vmat.json) — same hash-suffix rule as the icons, so the stem is
@@ -69,7 +80,8 @@ const seenPaint = new Set();
 for (const item of CS2Economy.itemsAsArray) {
   const pm = item.paintMaterial;
   if (typeof pm !== "string" || !pm.startsWith("/materials/")) continue;
-  if (!COMPOSITED_TYPES.has(item.type)) continue;
+  const decal = DECAL_TYPES.has(item.type);
+  if (!decal && !COMPOSITED_TYPES.has(item.type)) continue;
   if (seenPaint.has(pm)) continue;
   seenPaint.add(pm);
   const file = pm.slice("/materials/".length);
@@ -79,7 +91,9 @@ for (const item of CS2Economy.itemsAsArray) {
     out: file,
     stem: m[1].replace(/_[0-9a-f]{8}$/, ""),
     kind: m[2],
+    // Follow one texture, not the whole chain. The extractor reads this.
+    ...(decal ? { decal: true } : {}),
   });
 }
 
-process.stdout.write(JSON.stringify({ version: 2, icons, paints }));
+process.stdout.write(JSON.stringify({ version: 3, icons, paints }));

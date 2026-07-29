@@ -17,4 +17,12 @@ const devUser = {
   role: "administrator",
 };
 
-createApp(App, { user: devUser }).mount("#app");
+// The panel owns notifications and always passes `notify`, so App requires it
+// rather than carrying a second, hand-rolled toast that only ever ran here and
+// had to be kept looking like the panel's by hand. Standalone supplies its own
+// — a console line is enough to develop against.
+createApp(App, {
+  user: devUser,
+  notify: (message: string, kind: "error" | "success") =>
+    console[kind === "error" ? "error" : "log"](`[notify:${kind}] ${message}`),
+}).mount("#app");
