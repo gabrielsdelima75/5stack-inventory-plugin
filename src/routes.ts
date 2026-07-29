@@ -141,6 +141,10 @@ export interface DraftCharm {
   x?: number | null;
   y?: number | null;
   z?: number | null;
+  /** The charm's own pattern. Appended LAST so links written before charms had
+   *  one still parse — the encoder strips trailing empties, so an old
+   *  `id_x_y_z` simply arrives with no fifth field. */
+  seed?: number | null;
 }
 export interface Draft {
   wear: number;
@@ -188,7 +192,7 @@ export function encodeDraft(d: Draft, defaultWear: number): Record<string, strin
     if (id) out[`p${i}`] = String(id);
   });
   if (d.charm) {
-    out.charm = [String(d.charm.id), num(d.charm.x), num(d.charm.y), num(d.charm.z)]
+    out.charm = [String(d.charm.id), num(d.charm.x), num(d.charm.y), num(d.charm.z), num(d.charm.seed)]
       .join(SEP)
       .replace(/_+$/, "");
   }
@@ -217,10 +221,19 @@ export function decodeDraft(
   // attach() and silently landing `z` in the sticker rotation slot.
   const parseCharm = (raw: string | undefined): DraftCharm | null => {
     if (!raw) return null;
-    const [id, x, y, z] = raw.split(SEP);
+    const [id, x, y, z, seed] = raw.split(SEP);
     const n = Number(id);
     if (!Number.isInteger(n) || n <= 0) return null;
-    return { id: n, x: parseNum(x), y: parseNum(y), z: parseNum(z) };
+    // Clamped like the weapon's seed above: a mangled link must not hand the
+    // game server a nonsense pattern.
+    const p = parseNum(seed);
+    return {
+      id: n,
+      x: parseNum(x),
+      y: parseNum(y),
+      z: parseNum(z),
+      seed: p === null ? null : Math.min(100000, Math.max(0, Math.round(p))),
+    };
   };
 
   const wear = parseNum(q.wear);

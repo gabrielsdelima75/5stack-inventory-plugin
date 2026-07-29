@@ -92,6 +92,12 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v16 (2026-07-29): charm-shading.json (step 3e) — the per-material metalness
+# remap and roughness adjust from each keychain vmat. The GLB carries the raw
+# texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
+# authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
+# its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# Rendered raw, that is a chrome mirror where the game shows dull white.
 # v15 (2026-07-29): the KV3 parser now understands binary blobs (`#[ 07 00 ... ]`).
 # Every charm material carries one, so all 23 failed to parse in v14 with
 # "cannot tokenize at '#['" and not one was written — the community charms had
@@ -103,7 +109,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=15
+EXTRACT_VERSION=16
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -1604,6 +1610,12 @@ echo "--- Reading charm models…"
 rm -rf "$WORK/raw_items"
 "$CLI" -i "$VPK" -o "$WORK/raw_items" -d -f "scripts/items/items_game.txt" >/dev/null 2>&1 || true
 ITEMS_GAME="$(find "$WORK/raw_items" -name items_game.txt | head -1)"
+# Every keychain material's DATA block, for the shading params below. Written to
+# a FILE, not an environment variable: the dump is ~90 materials of KV3 and the
+# whole environment has to fit execve's limit, so inlining it failed the run
+# outright with "Argument list too long".
+"$CLI" -i "$VPK" -f "weapons/keychains/" -e vmat_c -b DATA >"$WORK/charm-vmats.txt" 2>/dev/null || true
+CHARM_SHADING="$WORK/charm-vmats.txt" \
 ITEMS_GAME="$ITEMS_GAME" DEST="$DEST" CHARM_MATS="$WORK/charm-materials.json" python3 - <<'PYEOF'
 import hashlib, json, os, re
 
@@ -1672,12 +1684,78 @@ if src and os.path.exists(src):
 
 with open(os.path.join(dest, "charm-models.json"), "w") as fh:
     json.dump(charms, fh, indent=1, sort_keys=True)
+
+# ---- How the game SHADES those materials -------------------------------------
+#
+# The decompiled GLB carries the raw texture channels, and taking them at face
+# value is wrong: csgo_weapon.vfx does not use them raw. Two params rewrite them,
+# and both are per material.
+#
+#   g_vMetalnessRemapRange  [min,max] the metalness channel is remapped into.
+#     Charm | Sasquatch is [0, 0.5]: its eyes are authored metalness 1, which the
+#     game renders as 0.5 and we rendered as a chrome mirror.
+#   g_fTextureRoughnessBrightness / Contrast  an affine adjust on roughness,
+#     applied when F_ENABLE_ADJUSTMENTS is set. Sasquatch is 1.9 / 0.7 — its
+#     roughness channel tops out at 0.51 and the game nearly doubles it.
+#
+# Emitted per MATERIAL STEM, not per charm: the clasp is its own material shared
+# across a whole collection, so charm-keyed params would put one charm's tuning
+# on everybody's chain. Identity values are dropped — the map is the exceptions.
+shading_src = os.environ.get("CHARM_SHADING", "")
+raw_vmats = ""
+if shading_src and os.path.exists(shading_src):
+    raw_vmats = open(shading_src, encoding="utf8", errors="replace").read()
+BLOCKS = re.split(r'--- Data for block "DATA" ---', raw_vmats)[1:]
+
+
+def num(block, param, key):
+    m = re.search(r'm_name = "%s"\s*\n\s*%s = ([-\d.]+)' % (param, key), block)
+    return float(m.group(1)) if m else None
+
+
+shading = {}
+for block in BLOCKS:
+    named = re.search(r'm_materialName = "([^"]+)"', block)
+    if not named:
+        continue
+    stem = os.path.basename(named.group(1)).split(".")[0]
+    entry = {}
+    remap = re.search(r'm_name = "g_vMetalnessRemapRange"\s*\n\s*m_value = \[ ([^\]]+) \]', block)
+    if remap:
+        lo, hi = [float(x) for x in remap.group(1).split(",")[:2]]
+        # Expressed as a SCALE on the metalness map, which is all a glTF material
+        # can carry. Exact whenever the range starts at 0, and every charm on
+        # this build does; a nonzero floor would need a real offset, so it is
+        # reported rather than silently approximated.
+        if lo != 0:
+            print(f"!!! {stem}: metalness remap floor {lo} is not modelled (range {lo}..{hi})")
+        elif hi != 1:
+            entry["metalness"] = round(hi, 4)
+    # Adjustments only apply when the material asks for them.
+    if num(block, "F_ENABLE_ADJUSTMENTS", "m_nValue"):
+        bright = num(block, "g_fTextureRoughnessBrightness", "m_flValue")
+        contrast = num(block, "g_fTextureRoughnessContrast", "m_flValue")
+        bright = 1.0 if bright is None else bright
+        contrast = 1.0 if contrast is None else contrast
+        # ((g - 0.5) * contrast + 0.5) * brightness, folded into scale + offset
+        # so the renderer applies one affine step instead of re-deriving it.
+        scale = contrast * bright
+        offset = bright * 0.5 * (1.0 - contrast)
+        if abs(scale - 1) > 1e-4 or abs(offset) > 1e-4:
+            entry["roughness"] = round(scale, 4)
+            entry["roughnessOffset"] = round(offset, 4)
+    if entry:
+        shading[stem] = entry
+
+with open(os.path.join(dest, "charm-shading.json"), "w") as fh:
+    json.dump(shading, fh, indent=1, sort_keys=True)
 # Handed to the paint chain, which owns extracting materials and their textures.
 with open(os.environ["CHARM_MATS"], "w") as fh:
     json.dump(sorted(set(mats)), fh)
 
 shared = len([c for c in charms.values() if "material" in c])
 print(f"--- Charm models: {len(charms)} charms, {shared} sharing a blank mesh with their own material")
+print(f"--- Charm shading: {len(shading)} of {len(BLOCKS)} materials need a metalness/roughness correction")
 if not charms:
     print("!!! No charm definitions recovered — charms will fall back to their "
           "flat art. Check that scripts/items/items_game.txt extracted.")

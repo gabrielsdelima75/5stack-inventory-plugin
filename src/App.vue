@@ -5,7 +5,7 @@ import en from "./locales/en.json";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -425,6 +425,11 @@ const INV_TOOLBAR =
 // sits flush with the rail's Clear button and the filter tiles under it. With
 // no rail (or below `lg`, where it's hidden) it falls back to the grid's p-6.
 const INV_TOOLBAR_PL = computed(() => (invRailShown.value ? "pl-6 lg:pl-2.5" : "pl-6"));
+// Chip shapes for the compact inventory filter sheet. 36px tall — these are the
+// only way to reach these filters on a phone, so they get a real target.
+const INV_CHIP = "flex h-9 items-center rounded-md border px-3 text-f10 uppercase tracking-cs1 transition-colors";
+const INV_CHIP_ON = "border-[color:var(--acc)] text-foreground";
+const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
 // Focus view's action row (Inspect / Share / StatTrak / Unequip): one height,
 // one radius, one type size — they drifted into four slightly different pills.
 //
@@ -593,6 +598,11 @@ function selectPos(pos: string) {
   const changed = selected.value !== pos;
   selected.value = pos;
   if (changed || sheetMode.value === "replace") sheetMode.value = signedIn.value ? "owned" : "craft";
+  // Raising the sheet lives here as well as in the `selected` watch, because
+  // re-tapping the slot you are already on doesn't change `selected` and so
+  // never fires it — and after minimising the picker, that re-tap is the
+  // gesture people reach for to bring it back.
+  if (isCompact.value && view.value === "grid") sheetSnap.value = "full";
 }
 
 // ---- rarity facets (rarity is a hex color from cs2-lib) ---------------------
@@ -1130,7 +1140,10 @@ const craft = ref<{
   nametag: string;
   stickers: (Attach | null)[];
   patches: (Attach | null)[];
-  charm: (Attach & { z?: number | null }) | null;
+  /** `seed` is the charm's own PATTERN, the same idea as the weapon's and a
+   *  tradeable attribute in its own right. Purely an attribute: CS2 varies no
+   *  charm geometry or art by it, so the 3D viewer never sees it. */
+  charm: (Attach & { z?: number | null; seed?: number | null }) | null;
 } | null>(null);
 // What attachments the selected slot's item supports.
 const attachKind = computed<"weapon" | "agent" | "none">(() => {
@@ -1210,9 +1223,12 @@ async function restoreDraftRoute(skinId: number) {
           .slice(0, 5)
           .map((s) => attach(s, { x: s?.x ?? null, y: s?.y ?? null, r: s?.r ?? null, w: s?.w ?? null })),
         patches: d.patches.slice(0, 5).map((p) => attach(p ? { id: p } : null)),
-        charm: attach(d.charm, { x: d.charm?.x ?? null, y: d.charm?.y ?? null, z: d.charm?.z ?? null }) as
-          | (Attach & { z?: number | null })
-          | null,
+        charm: attach(d.charm, {
+          x: d.charm?.x ?? null,
+          y: d.charm?.y ?? null,
+          z: d.charm?.z ?? null,
+          seed: d.charm?.seed ?? null,
+        }) as (Attach & { z?: number | null; seed?: number | null }) | null,
       };
       craftBaseline = "";
     });
@@ -1245,7 +1261,7 @@ function openEdit(inst: InventoryItem) {
     stickers,
     patches,
     charm: inst.charm
-      ? { id: inst.charm.id, name: inst.charm.name, image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null }
+      ? { id: inst.charm.id, name: inst.charm.name, image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null }
       : null,
   };
   // Until something changes, show the render we already have for this item.
@@ -1356,6 +1372,11 @@ function randomWear() {
 function randomSeed() {
   if (craft.value) craft.value.seed = Math.floor(rand(1, 1001));
 }
+// Charm patterns run to 100000, an order of magnitude past a weapon's 1000 —
+// they are their own attribute with their own range, not the weapon's reused.
+function randomCharmSeed() {
+  if (craft.value?.charm) craft.value.charm.seed = Math.floor(rand(1, 100001));
+}
 function resetCraft() {
   if (craft.value)
     Object.assign(craft.value, {
@@ -1381,7 +1402,7 @@ function craftBody() {
     stickers: c.stickers.map(toSpec),
     patches: c.patches.map(toSpec),
     charm_id: c.charm?.id ?? null,
-    charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null } : null,
+    charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null } : null,
   };
 }
 // Inspect the DRAFT — works before the craft has ever been saved.
@@ -1496,11 +1517,32 @@ const assetsPending = ref(false);
 // missing renders backfills calmly instead of exhausting context limits.
 let renderQueue: Promise<unknown> = Promise.resolve();
 const queuedIds = ref<Set<number>>(new Set());
+
+// ---- phone budget -----------------------------------------------------------
+// Serialising the queue bounds how many bakes run AT ONCE (one, here and again
+// in viewer3d's build lane). It does not bound how many get ASKED for, and on a
+// phone that is the number that matters: scrolling a long grid can enqueue
+// dozens in a second, each one a context created, a 2K paint composited, and
+// the context torn down again. Mobile Safari starts shedding the oldest context
+// once too many have existed and Android Chrome just runs the tab out of
+// memory — which is the crash.
+//
+// So on touch devices: keep a short backlog, and leave a gap between bakes for
+// the browser to actually reclaim the last one. Cards that lose their turn show
+// catalog art and ask again next time they scroll into view.
+const TOUCH_BAKE_BACKLOG = 3;
+const TOUCH_BAKE_COOLDOWN_MS = 400;
+const bakeCooldown = () =>
+  isCoarse.value ? new Promise((r) => setTimeout(r, TOUCH_BAKE_COOLDOWN_MS)) : Promise.resolve();
+
 function generateRender(inst: InventoryItem): Promise<boolean> {
   if (renderedIds.has(inst.id) || queuedIds.value.has(inst.id)) return Promise.resolve(false);
+  if (isCoarse.value && queuedIds.value.size >= TOUCH_BAKE_BACKLOG) return Promise.resolve(false);
   queuedIds.value = new Set([...queuedIds.value, inst.id]);
   const run = renderQueue.then(() => generateRenderNow(inst));
-  renderQueue = run.catch(() => false);
+  // The cooldown rides the QUEUE, not the returned promise: the next bake waits
+  // for it, the caller doesn't.
+  renderQueue = run.catch(() => false).then(bakeCooldown);
   return run.finally(() => {
     const next = new Set(queuedIds.value);
     next.delete(inst.id);
@@ -1862,7 +1904,7 @@ function draftFromCraft(): Draft | null {
     nametag: c.nametag,
     stickers: c.stickers.map((s) => (s ? { id: s.id, x: s.x, y: s.y, r: s.r, w: s.w } : null)),
     patches: c.patches.map((p) => p?.id ?? null),
-    charm: c.charm ? { id: c.charm.id, x: c.charm.x, y: c.charm.y, z: c.charm.z } : null,
+    charm: c.charm ? { id: c.charm.id, x: c.charm.x, y: c.charm.y, z: c.charm.z, seed: c.charm.seed } : null,
   };
 }
 
@@ -2639,6 +2681,41 @@ function itemCtxPos(): string | null {
   if (!inst) return null;
   return view.value === "inventory" ? positionForInstance(inst) : selected.value;
 }
+/**
+ * Teams this item is ALREADY equipped on, at the slot it would land in.
+ *
+ * Equipping is idempotent server-side, so re-equipping was harmless but
+ * pointless: the menu offered "Equip on CT" for a skin already on CT, and
+ * taking it spent a round trip and a loadout refresh to arrive back where you
+ * started. Scoped to the target slot on purpose — the same instance can be on
+ * CT in slot 1 and nowhere on T, and only slot 1 is settled.
+ */
+const itemCtxEquippedOn = computed<Set<Team>>(() => {
+  const inst = itemCtx.value?.inst;
+  const on = new Set<Team>();
+  if (!inst) return on;
+  const equipped = inst.equipped ?? [];
+  // Inventory view has no target slot in mind — you opened a card, not a
+  // loadout cell. So the question is just "is this item on that team", and
+  // matching against positionForInstance's guess was the bug: it returns the
+  // slot the item WOULD land in, which for a weapon already sitting in a
+  // different slot of the same group is not the slot it is equipped at. The
+  // row then read "Equip on CT" for a skin that was plainly on CT.
+  if (view.value === "inventory") {
+    equipped.forEach((e) => on.add(e.team));
+    return on;
+  }
+  // In the loadout the slot IS the question — the same instance can be on CT
+  // in one slot and absent from another, and only the selected one is settled.
+  const pos = selected.value;
+  if (pos) equipped.forEach((e) => e.slot === pos && on.add(e.team));
+  return on;
+});
+/** Shared slots (knife, gloves, agent…) are one decision, not two — they're
+ *  settled only when BOTH sides already carry this item. */
+const itemCtxSharedEquipped = computed(
+  () => itemCtxEquippedOn.value.has("CT") && itemCtxEquippedOn.value.has("T"),
+);
 async function ctxEquipTeams(teams: Team[]) {
   const inst = itemCtx.value?.inst;
   const pos = itemCtxPos();
@@ -2705,6 +2782,76 @@ function openCtxFor(pos: string, at?: { x: number; y: number }) {
 const openCtx = (pos: string, e: MouseEvent) => openCtxFor(pos, { x: e.clientX, y: e.clientY });
 const closeCtx = () => (ctx.value = null);
 
+// ---- swipe down to dismiss (compact bottom sheets) --------------------------
+// Every compact menu already draws a grab pill, which promises a drag none of
+// them honoured: the only way out was tapping the backdrop, and on a tall sheet
+// that means reaching over the whole thing to the strip above it — one-handed,
+// the hardest pixel on the screen to hit. This makes the pill's promise true.
+//
+// Shared drag state rather than one set per sheet: only one of these can be
+// open at a time, and the sheet being dragged is the only one mounted.
+const swipeOffset = ref(0);
+/** Live transform for a sheet mid-swipe. No transition while the finger is
+ *  down (it must track exactly), a spring back when it lifts without passing
+ *  the threshold. */
+const swipeStyle = computed(() =>
+  swipeOffset.value
+    ? { transform: `translateY(${swipeOffset.value}px)`, transition: "none" }
+    : { transition: reducedMotion.value ? "none" : "transform 200ms cubic-bezier(0.22,1,0.36,1)" },
+);
+/**
+ * Handlers for `v-on` on a sheet's grab area. Dismisses past a third of the
+ * sheet's own height, or on a flick faster than 0.5px/ms — so a short sheet
+ * needs a short drag and a tall one doesn't dismiss on a twitch.
+ *
+ * Capture is LAZY: taken only once the finger has actually travelled, never on
+ * pointerdown. That is what lets the whole sheet header carry this without
+ * swallowing taps on the controls inside it (the filter sheet's Reset button
+ * sits in its header) — pointer capture retargets the click that follows, so
+ * capturing eagerly would eat it.
+ */
+const SWIPE_ARM_PX = 4;
+function swipeToDismiss(close: () => void) {
+  let sheet: HTMLElement | null = null;
+  let dragging = false;
+  let y0 = 0;
+  let t0 = 0;
+  const reset = () => {
+    sheet = null;
+    dragging = false;
+    swipeOffset.value = 0;
+  };
+  return {
+    pointerdown(e: PointerEvent) {
+      if (!isCompact.value) return;
+      sheet = (e.currentTarget as HTMLElement).closest<HTMLElement>("[data-sheet]");
+      dragging = false;
+      y0 = e.clientY;
+      t0 = e.timeStamp;
+    },
+    // Down only. Following a finger upwards would tear the sheet off the
+    // bottom edge it is anchored to and show background under it.
+    pointermove(e: PointerEvent) {
+      if (!sheet) return;
+      const dy = e.clientY - y0;
+      if (!dragging) {
+        if (dy < SWIPE_ARM_PX) return;
+        dragging = true;
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      }
+      swipeOffset.value = Math.max(0, dy);
+    },
+    pointerup(e: PointerEvent) {
+      if (!sheet || !dragging) return reset();
+      const dy = Math.max(0, e.clientY - y0);
+      const gone = dy > sheet.getBoundingClientRect().height / 3 || dy / Math.max(1, e.timeStamp - t0) > 0.5;
+      reset();
+      if (gone) close();
+    },
+    pointercancel: reset,
+  };
+}
+
 // ---- long-press → the slot menu (touch has no right-click) ------------------
 // Delegated from the loadout container instead of bound per-slot: every slot
 // already carries data-slot for the drag/drop system, and there are five
@@ -2714,8 +2861,6 @@ const LONG_PRESS_SLOP = 10; // movement past this is a scroll, not a press
 let lpTimer: ReturnType<typeof setTimeout> | undefined;
 let lpOrigin: { x: number; y: number } | null = null;
 let lpFired = false;
-// Sticky across sessions: once you know the gesture you don't need telling.
-const hasLongPressed = ref(localStorage.getItem("cs2inv.lp") === "1");
 
 function cancelLongPress() {
   clearTimeout(lpTimer);
@@ -2734,10 +2879,6 @@ function onSlotPointerDown(e: PointerEvent) {
     // Haptic confirmation the press "took" — without it the gesture feels
     // broken for the frame or two before the menu paints.
     navigator.vibrate?.(8);
-    if (!hasLongPressed.value) {
-      hasLongPressed.value = true;
-      localStorage.setItem("cs2inv.lp", "1");
-    }
     openCtxFor(pos);
   }, LONG_PRESS_MS);
 }
@@ -2787,6 +2928,11 @@ const compactEquipment = computed(() => [RAIL[2], RAIL[1], RAIL[0], ...EXTRAS]);
 // single item is visible. Compact collapses them behind one chip; desktop has
 // the width to show them inline and never sees this flag.
 const sheetFiltersOpen = ref(false);
+// The three compact bottom sheets, each wired to its own dismiss. Declared
+// here because the filter sheet's flag is — see swipeToDismiss above.
+const slotMenuSwipe = swipeToDismiss(closeCtx);
+const itemMenuSwipe = swipeToDismiss(closeItemCtx);
+const filterSheetSwipe = swipeToDismiss(() => (sheetFiltersOpen.value = false));
 // Search counts as an active filter on compact — it lives inside the sheet
 // there, so without it in the badge a search you forgot about is invisible.
 const sheetFilterCount = computed(
@@ -2846,6 +2992,14 @@ watch(sheetLift, (v) => localStorage.setItem("cs2inv.sheetLift", v ? "1" : "0"))
 // 3D viewer route replaces it entirely (`v-if="!viewerId"`), and reserving
 // space for a sheet that isn't rendered would leave a dead strip.
 const canLift = computed(() => !isCompact.value && !viewerId.value);
+
+// Tap-to-equip is a desktop affordance: it leans on hover to preview what the
+// click will do and on a cursor-precise target. On touch a tap opens the action
+// menu instead — whose Equip rows are the same one tap anyway, but named.
+// Keyed off compact as well as coarse because a narrowed desktop window is
+// exactly where the phone layout gets tested, and there a stray tap silently
+// re-equipped the slot with no menu and no undo.
+const tapOpensMenu = computed(() => isCoarse.value || isCompact.value);
 const lifted = computed(() => canLift.value && sheetLift.value);
 
 const loadoutEl = ref<HTMLElement | null>(null);
@@ -2863,7 +3017,18 @@ const liftIntrusion = computed(() =>
 
 // Reserved on the loadout side so the collapsed layout is exactly what it was
 // when the sheet still took its space in flow.
-const loadoutPadStyle = computed(() => (canLift.value ? { paddingBottom: SHEET_COLLAPSED_CSS } : {}));
+// Compact reserves the PEEK height as a constant. The sheet is out of flow so
+// it can be transform-driven (see sheetStyle), which means without this the
+// loadout's last row would sit permanently under the collapsed sheet. A
+// constant, deliberately — anything snap-dependent would relayout the loadout
+// mid-animation and reintroduce exactly the jank the transform is avoiding.
+const loadoutPadStyle = computed(() =>
+  isCompact.value
+    ? { paddingBottom: `${Math.round(sheetPeekPx.value || loadoutH.value * PEEK_FRAC)}px` }
+    : canLift.value
+      ? { paddingBottom: SHEET_COLLAPSED_CSS }
+      : {},
+);
 // Every loadout scroller gets the same pair: a spacer in the template gives it
 // somewhere to scroll TO, and scroll-padding keeps browser-driven scrolls (tab
 // focus, mostly) from landing under the sheet.
@@ -2918,7 +3083,7 @@ watch(loadoutEl, (el) => {
 const COMPACT_CARD_H = 118; // slot card min-height
 const COMPACT_GRID_GAP = 8; // grid gap-2
 const COMPACT_GRID_PAD = 28; // pt-3 + pb-4
-const COMPACT_RAIL_H = 43; // category rail, measured
+const COMPACT_RAIL_H = 34; // category rail, measured (min-h-[30px] + py-0.5)
 const HALF_RESERVE = 2 * COMPACT_CARD_H + COMPACT_GRID_GAP + COMPACT_GRID_PAD + COMPACT_RAIL_H;
 const PEEK_FRAC = 0.22;
 const FULL_FRAC = 0.86;
@@ -2926,15 +3091,92 @@ const FULL_FRAC = 0.86;
 // the loadout and leave the picker a sliver.
 const HALF_MIN_FRAC = 0.3;
 
+/**
+ * The compact picker is a NATIVE-STYLE bottom sheet: it is always full height
+ * and every detent is a `translateY`. Nothing about the drag touches layout.
+ *
+ * It used to animate `height` directly, which meant each of the ~60 frames of a
+ * drag relaid out the flex column, the loadout grid above it AND the item grid
+ * inside it. That is the jerk — a drag that visibly stepped rather than
+ * tracked. Transform is compositor-only, so the sheet now follows the finger at
+ * refresh rate however much is in the grid.
+ *
+ * The cost is that the sheet must be out of flow (it is `absolute`, same as
+ * desktop) and the loadout has to reserve the peek height as padding so its
+ * last row never sits permanently underneath. That reserve is a constant, so it
+ * never animates.
+ */
+// `peek` is the FLOOR, not a way station — a swipe down minimises the sheet,
+// it never dismisses it. Collapsing to nothing meant the only route back was
+// tapping a slot, which is a rule you have to already know; leaving the header
+// on screen keeps the picker's own handle as the way back in. The loadout
+// reserves exactly this height (loadoutPadStyle), so a minimised sheet covers
+// nothing.
 type SheetSnap = "peek" | "half" | "full";
-function snapFrac(s: SheetSnap, containerH: number): number {
-  if (s === "peek") return PEEK_FRAC;
-  if (s === "full") return FULL_FRAC;
-  return containerH > 0 ? Math.max(HALF_MIN_FRAC, (containerH - HALF_RESERVE) / containerH) : 0.5;
+/** Detents low→high. Order is load-bearing: flicks step through this array. */
+const SHEET_DETENTS: SheetSnap[] = ["peek", "half", "full"];
+/**
+ * Minimised height: MEASURED, as exactly the grab handle plus the mode/filter
+ * row — no tally, no clipped first row of cards.
+ *
+ * It was a fraction of the viewport, which meant the strip landed wherever the
+ * arithmetic put it: a sliver of grid on a tall phone, half the tally bar on a
+ * short one. Neither is a state worth having. Minimised should show the
+ * controls that switch what the sheet is showing and nothing else — you either
+ * want the tabs or you want the list.
+ */
+const sheetPeekPx = ref(0);
+let peekRO: ResizeObserver | null = null;
+/** Function ref on the wrapper holding grab handle + toolbar — its own
+ *  `offsetHeight` IS the minimised height. Deliberately not `offsetTop +
+ *  offsetHeight` of the toolbar alone: that depends on which ancestor happens
+ *  to be the offsetParent, and read a frame too early it returns 0, which
+ *  silently fell back to the old viewport fraction and left a band of dead
+ *  space under the tabs. A wrapper's own height has neither failure mode. */
+function setSheetPeekEl(el: unknown) {
+  peekRO?.disconnect();
+  peekRO = null;
+  const node = el as HTMLElement | null;
+  if (!node) return;
+  const measure = () => {
+    const h = node.offsetHeight;
+    if (h > 0) sheetPeekPx.value = h;
+  };
+  measure();
+  if (typeof ResizeObserver === "undefined") return;
+  // The toolbar wraps to a second row at narrow widths and when the filter
+  // chip gains its badge, so its height is not a constant. The observer also
+  // covers the mount-time 0 above — it fires once on observe.
+  peekRO = new ResizeObserver(measure);
+  peekRO.observe(node);
 }
+/** Visible height of a detent, in px. */
+function snapPx(s: SheetSnap, hostH: number): number {
+  // Fraction only as a fallback for the frame before the toolbar is measured.
+  if (s === "peek") return sheetPeekPx.value || hostH * PEEK_FRAC;
+  if (s === "full") return hostH * FULL_FRAC;
+  return Math.max(hostH * HALF_MIN_FRAC, hostH - HALF_RESERVE);
+}
+// iOS's sheet curve: leaves fast, arrives slow, no overshoot. A spring here
+// reads as bounce on a panel this size.
+const SHEET_EASE = "cubic-bezier(0.32,0.72,0,1)";
+const SHEET_SNAP_MS = 340;
+/** px/ms past which a gesture is a flick (step a detent) rather than a drag
+ *  (settle at the nearest). Roughly a deliberate flick of the thumb. */
+const FLICK_V = 0.45;
+/** …and past which it is a hard throw that goes straight to the end. */
+const THROW_V = 1.1;
+
 const sheetSnap = ref<SheetSnap>("half");
+/** Live translateY mid-drag; null means "resting at sheetSnap". */
 const sheetDragPx = ref<number | null>(null);
-let sheetDrag: { y: number; h: number; max: number; moved: boolean } | null = null;
+const sheetFullPx = computed(() => Math.round(loadoutH.value * FULL_FRAC));
+/** How far the sheet is pushed down from fully open. 0 = full, sheetFullPx = gone. */
+const sheetTranslate = computed(() =>
+  sheetDragPx.value != null
+    ? sheetDragPx.value
+    : Math.max(0, sheetFullPx.value - snapPx(sheetSnap.value, loadoutH.value)),
+);
 
 const sheetStyle = computed(() => {
   if (!isCompact.value) {
@@ -2948,47 +3190,141 @@ const sheetStyle = computed(() => {
       boxShadow: lifted.value ? "0 -18px 40px -22px hsl(var(--background))" : "none",
     };
   }
-  const snap = sheetSnap.value;
-  const height =
-    sheetDragPx.value != null
-      ? `${sheetDragPx.value}px`
-      : snap === "half"
-        // CSS does the arithmetic so the reserve holds at any viewport height
-        // without this needing to observe the container.
-        ? `max(${HALF_MIN_FRAC * 100}%, calc(100% - ${HALF_RESERVE}px))`
-        : `${(snap === "peek" ? PEEK_FRAC : FULL_FRAC) * 100}%`;
-  // No transition mid-drag — the height must track the finger exactly.
-  return { height, transition: sheetDragPx.value == null ? "height 260ms cubic-bezier(0.22,1,0.36,1)" : "none" };
+  return {
+    height: `${sheetFullPx.value}px`,
+    // translate3d, not translateY: it promotes the sheet to its own layer, so
+    // the grid inside is rasterised once and the drag is a matrix update.
+    transform: `translate3d(0, ${sheetTranslate.value}px, 0)`,
+    // No transition mid-drag — it must track the finger exactly, not chase it.
+    transition:
+      sheetDragPx.value != null || reducedMotion.value ? "none" : `transform ${SHEET_SNAP_MS}ms ${SHEET_EASE}`,
+    boxShadow: "0 -18px 40px -22px hsl(var(--background))",
+  };
 });
 
+// The sheet is out of flow now, so on compact it OVERLAYS whatever is behind
+// it rather than sharing the column. In the grid that's the point; in focus
+// view the thing behind it is the 3D stage, and arriving there still at `full`
+// from the grid would bury it. Collapse to peek on the way in — the stage
+// already reserves that much padding, so nothing ends up hidden.
+watch(view, (v) => {
+  if (isCompact.value && v === "focus" && sheetSnap.value === "full") sheetSnap.value = "peek";
+});
+
+// Switching Owned/Craft/Replace is a statement of intent to browse that list —
+// same as tapping a slot. It used to leave the sheet at whatever detent it was
+// on, so picking "Craft" from a minimised sheet swapped the contents of a strip
+// you couldn't see into and looked like the tab had done nothing. Every mode
+// change opens it. This also covers the programmatic switches (a replace
+// dropping you back on Owned, the slot menu's Pick/Craft/Replace rows), which
+// are intent to browse just as much as a tab tap is.
+watch(sheetMode, () => {
+  if (isCompact.value && view.value === "grid") sheetSnap.value = "full";
+});
+
+/** Bound to the sheet header via `v-on`. Empty on desktop, which drags by
+ *  lifting the whole panel with a button instead. */
+const sheetHeaderDrag = computed(() =>
+  isCompact.value
+    ? {
+        pointerdown: onSheetDragStart,
+        pointermove: onSheetDragMove,
+        pointerup: onSheetDragEnd,
+        pointercancel: onSheetDragEnd,
+      }
+    : {},
+);
+
+/** Detent whose height sits closest to a given visible height. */
+function nearestSnap(visiblePx: number): SheetSnap {
+  const d = (s: SheetSnap) => Math.abs(snapPx(s, loadoutH.value) - visiblePx);
+  return SHEET_DETENTS.reduce((best, s) => (d(s) < d(best) ? s : best), SHEET_DETENTS[0]);
+}
+
+// Capture is taken lazily (see SWIPE_ARM_PX) so the toolbar buttons sharing
+// this drag surface keep their taps — pointer capture retargets the click.
+let sheetDrag: {
+  y0: number;
+  base: number;
+  lastY: number;
+  lastT: number;
+  vy: number;
+  moved: boolean;
+  captured: boolean;
+  /** The gesture started on a control (a mode tab, the filter chip), so a tap
+   *  belongs to that control and must not also toggle the sheet. A DRAG from
+   *  the same spot is still a drag — you can swipe starting anywhere. */
+  onControl: boolean;
+} | null = null;
+
 function onSheetDragStart(e: PointerEvent) {
-  const handle = e.currentTarget as HTMLElement;
-  const host = handle.closest<HTMLElement>("[data-role='picker-sheet']");
-  const container = host?.parentElement;
-  if (!host || !container) return;
-  sheetDrag = { y: e.clientY, h: host.getBoundingClientRect().height, max: container.clientHeight, moved: false };
-  handle.setPointerCapture(e.pointerId);
+  if (!isCompact.value) return;
+  sheetDrag = {
+    y0: e.clientY,
+    base: sheetTranslate.value,
+    lastY: e.clientY,
+    lastT: e.timeStamp,
+    vy: 0,
+    moved: false,
+    captured: false,
+    onControl: !!(e.target as HTMLElement | null)?.closest?.("button, a, input, select, label"),
+  };
 }
 function onSheetDragMove(e: PointerEvent) {
   if (!sheetDrag) return;
-  const dy = e.clientY - sheetDrag.y;
-  if (Math.abs(dy) > 3) sheetDrag.moved = true;
-  // Dragging up grows the sheet, so the delta is inverted.
-  sheetDragPx.value = Math.max(sheetDrag.max * 0.14, Math.min(sheetDrag.h - dy, sheetDrag.max * 0.9));
+  const dy = e.clientY - sheetDrag.y0;
+  if (!sheetDrag.moved) {
+    if (Math.abs(dy) < SWIPE_ARM_PX) return;
+    sheetDrag.moved = true;
+    sheetDrag.captured = true;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  // Velocity as an EMA over the recent frames, so one stuttery frame at the
+  // moment of release can't decide the whole gesture.
+  const dt = e.timeStamp - sheetDrag.lastT;
+  if (dt > 0) {
+    sheetDrag.vy = 0.7 * ((e.clientY - sheetDrag.lastY) / dt) + 0.3 * sheetDrag.vy;
+    sheetDrag.lastY = e.clientY;
+    sheetDrag.lastT = e.timeStamp;
+  }
+  // Rubber band at BOTH ends — fully open at the top, minimised at the bottom.
+  // The sheet resists instead of stopping dead, which is what tells a finger it
+  // has hit the end of the track rather than that the drag broke. Without the
+  // lower band a hard swipe drags the header clean off the screen and then
+  // springs it back, which reads as the sheet having closed and reopened.
+  const minimised = sheetFullPx.value - snapPx("peek", loadoutH.value);
+  let next = sheetDrag.base + dy;
+  if (next < 0) next = next / 3;
+  else if (next > minimised) next = minimised + (next - minimised) / 3;
+  sheetDragPx.value = next;
 }
 function onSheetDragEnd() {
   if (!sheetDrag) return;
-  // A tap (no travel) cycles rather than snapping to where it already was —
-  // the handle should do something useful for people who don't think to drag.
-  if (!sheetDrag.moved) sheetSnap.value = sheetSnap.value === "full" ? "peek" : sheetSnap.value === "half" ? "full" : "half";
-  else {
-    const frac = (sheetDragPx.value ?? 0) / sheetDrag.max;
-    const snaps: SheetSnap[] = ["peek", "half", "full"];
-    const d = (k: SheetSnap) => Math.abs(snapFrac(k, sheetDrag!.max) - frac);
-    sheetSnap.value = snaps.reduce((best, k) => (d(k) < d(best) ? k : best), snaps[0]);
-  }
-  sheetDragPx.value = null;
+  const { moved, vy, onControl } = sheetDrag;
+  const at = sheetDragPx.value ?? 0;
   sheetDrag = null;
+  sheetDragPx.value = null;
+  // A tap (no travel) toggles minimised ↔ open, for people who don't think to
+  // drag — and because minimised deliberately shows nothing but the tabs, so
+  // tapping the strip is the obvious way to ask for the list back.
+  //
+  // Skipped when the tap landed on a control: the whole header is the drag
+  // surface now, so without this, tapping "Craft" would switch the mode AND
+  // collapse the sheet out from under the list it just loaded.
+  if (!moved) {
+    if (!onControl) sheetSnap.value = sheetSnap.value === "peek" ? "full" : "peek";
+    return;
+  }
+  const landed = nearestSnap(sheetFullPx.value - at);
+  const i = SHEET_DETENTS.indexOf(landed);
+  // A throw goes all the way; a flick steps one detent; anything slower just
+  // settles where you left it. Without this a slow drag and a fast swipe did
+  // exactly the same thing, which is why a big swipe never dismissed.
+  if (vy > THROW_V) sheetSnap.value = "peek";
+  else if (vy < -THROW_V) sheetSnap.value = "full";
+  else if (vy > FLICK_V) sheetSnap.value = SHEET_DETENTS[Math.max(0, i - 1)];
+  else if (vy < -FLICK_V) sheetSnap.value = SHEET_DETENTS[Math.min(SHEET_DETENTS.length - 1, i + 1)];
+  else sheetSnap.value = landed;
 }
 
 // Same adjustable card size as the Inventory grid. The default is roomier
@@ -2997,14 +3333,126 @@ function onSheetDragEnd() {
 // still fits two columns.
 const sheetCardSize = ref(Number(localStorage.getItem("cs2inv.sheetCardSize")) || 176);
 watch(sheetCardSize, (v) => localStorage.setItem("cs2inv.sheetCardSize", String(v)));
+
+// ---- compact: rows for picking, cards for browsing --------------------------
+// Compact used to reuse the desktop card at a 168px clamp. With CARD_CHROME_PX
+// under it that's a 246px row, and the sheet at its `half` snap only has about
+// 210px of scroller — so not one full row fit, and the two visible cards sat
+// clipped by the viewport edge with nothing to say a third existed.
+//
+// Owned/Replace are LISTS you pick from: a row shows the whole name, and six
+// fit where two did. Craft is a gallery you browse — a finish is a picture, so
+// it stays a grid, just at a phone-sized tile with a phone-sized chrome (the
+// craft card is art + one name line, nowhere near the 78px a full item card
+// needs for its header, attachments and wear bar).
+// Budget: 44px thumb vs a text column of model line (12) + name (16) + gap (4)
+// + inline wear bar (~12) = 44, whichever is taller, plus py-2 top and bottom.
+// 66 leaves a couple of pixels of slack without letting a row go slack-jawed.
+const COMPACT_ROW_H = 66;
+const COMPACT_CRAFT_TILE = 108;
+const COMPACT_CRAFT_CHROME = 56;
+/** Rows, not cards. Compact + a mode you pick from rather than browse. */
+const sheetRows = computed(() => isCompact.value && sheetMode.value !== "craft");
 const pickerGridStyle = computed(() => {
-  const tile = isCompact.value ? Math.min(sheetCardSize.value, 168) : sheetCardSize.value;
+  if (sheetRows.value) {
+    return { display: "grid", gridTemplateColumns: "1fr", gridAutoRows: `${COMPACT_ROW_H}px` };
+  }
+  const tile = isCompact.value ? COMPACT_CRAFT_TILE : sheetCardSize.value;
+  const chrome = isCompact.value ? COMPACT_CRAFT_CHROME : CARD_CHROME_PX;
   return {
     display: "grid",
     gridTemplateColumns: `repeat(auto-fill, minmax(${tile}px, 1fr))`,
-    gridAutoRows: `${tile + CARD_CHROME_PX}px`,
+    gridAutoRows: `${tile + chrome}px`,
   };
 });
+
+// The picker holds entries that aren't ItemTiles — the craft prompt, the stock
+// default, the Replace candidates. They have to follow the same card/row switch
+// or they stay card-shaped inside a 74px grid row and squash.
+const SHEET_ENTRY = computed(() =>
+  sheetRows.value ? "flex w-full items-center gap-3 px-2.5 py-2" : "flex h-full flex-col px-2.5 py-2.5",
+);
+const SHEET_ART = computed(() =>
+  sheetRows.value ? "grid h-11 w-14 flex-none place-items-center rounded bg-background/40" : CARD_ART,
+);
+
+// ---- "there is more below" --------------------------------------------------
+// The picker is a short scroller inside a sheet inside a page; none of the
+// usual cues (a scrollbar, the page continuing past the fold) are available on
+// a phone. So it says so: a live count in the header, and a fade over the
+// bottom edge that clears once you've reached the end.
+const sheetHasMore = ref(false);
+function measureSheetScroll(el: HTMLElement | null) {
+  if (!el) return void (sheetHasMore.value = false);
+  // The compact sheet is always full height and pushed down by a transform, so
+  // at any detent below `full` part of the scroller is off the bottom of the
+  // screen. That hidden strip is content below the fold too — count it, or the
+  // tally claims you've seen everything while a whole detent's worth is
+  // sitting under the edge.
+  const offscreen = isCompact.value ? sheetTranslate.value : 0;
+  sheetHasMore.value = el.scrollHeight - el.scrollTop - el.clientHeight + offscreen > 8;
+}
+const onSheetScroll = (e: Event) => measureSheetScroll(e.target as HTMLElement);
+// Function ref rather than a plain one: the scroller is keyed on
+// mode|weapon inside an out-in Transition, so it is destroyed and rebuilt on
+// every mode switch and a static ref would go stale. Measured on the next frame
+// because the grid's children mount after the container does.
+let sheetScrollEl: HTMLElement | null = null;
+function setSheetScrollEl(el: unknown) {
+  sheetScrollEl = (el as HTMLElement) ?? null;
+  if (sheetScrollEl) requestAnimationFrame(() => measureSheetScroll(sheetScrollEl));
+  else sheetHasMore.value = false;
+}
+// The window grows as you scroll (InfiniteSentinel) and shrinks as you filter;
+// both change whether there's more below without any scroll event firing.
+watch(
+  [
+    () => sheetResultCount.value,
+    () => ownedWindow.items.value.length,
+    () => craftWindow.items.value.length,
+    sheetSnap,
+    sheetTranslate,
+  ],
+  () => requestAnimationFrame(() => measureSheetScroll(sheetScrollEl)),
+);
+/**
+ * The same cue for any ORDINARY scroller — the picker sheet keeps its own
+ * (measureSheetScroll) because part of its box deliberately hangs off the
+ * bottom of the screen, which nothing else does.
+ *
+ * `remeasure` exists because the two things that change "is there more below"
+ * on these grids — the render window growing as you scroll, and the filter set
+ * shrinking — neither of them fires a scroll event.
+ */
+function scrollFade() {
+  const more = ref(false);
+  let el: HTMLElement | null = null;
+  const measure = () => (more.value = !!el && el.scrollHeight - el.scrollTop - el.clientHeight > 8);
+  return {
+    more,
+    onScroll: (e: Event) => {
+      el = e.target as HTMLElement;
+      measure();
+    },
+    /**
+     * Function ref for the WRAPPER, which then finds the scroller inside it by
+     * `data-scroller`. Indirect on purpose: the inventory grid is a
+     * <TransitionGroup>, and a ref on that hands back the component instance,
+     * not the element that actually scrolls.
+     */
+    setHost: (node: unknown) => {
+      el = (node as HTMLElement | null)?.querySelector<HTMLElement>("[data-scroller]") ?? null;
+      if (el) requestAnimationFrame(measure);
+      else more.value = false;
+    },
+    remeasure: () => requestAnimationFrame(measure),
+  };
+}
+const invFade = scrollFade();
+// cardSize is watched separately, down where it's declared — it changes row
+// heights, so it changes whether there's more below.
+watch([() => inventoryWindow.items.value.length, () => filteredInventory.value.length], invFade.remeasure);
+
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
 // pulls the rail to the category that actually contains it — otherwise the
 // selection highlight lands on a card the user can't see.
@@ -3013,7 +3461,17 @@ watch(selected, (pos) => {
   if (c !== compactCat.value) compactCat.value = c;
   // Picking a slot is a statement of intent to change it — surface the picker
   // if it was collapsed. Never shrink an already-open sheet.
-  if (sheetSnap.value === "peek") sheetSnap.value = "half";
+  //
+  // Compact goes all the way to `full` rather than `half`: `half` reserves
+  // HALF_RESERVE (315px) for the loadout behind it, which on a phone leaves the
+  // picker too short to show even one card row. The slot you just tapped is
+  // named in the sheet's own header, so the loadout underneath has nothing left
+  // to tell you — and the grab handle drops back to it in one gesture.
+  //
+  // Grid view only. In focus view the thing behind the sheet is the 3D stage,
+  // which IS the screen — burying it to show a picker inverts the mode.
+  if (isCompact.value && view.value === "grid") sheetSnap.value = "full";
+  else if (sheetSnap.value === "peek") sheetSnap.value = "half";
 });
 function ctxOwned() {
   sheetMode.value = "owned";
@@ -3134,9 +3592,68 @@ function clearInvFilters() {
   invModels.value = [];
   invTypes.value = [];
 }
+// ---- compact: the inventory filter sheet ------------------------------------
+// Same treatment the picker got. The desktop toolbar is a search field, an
+// origin pill, two dropdowns and a sort-direction toggle on one line — it needs
+// ~600px and a phone has ~376, so it scrolled sideways with most of the
+// controls off the edge. The rail carrying the type/model facets is `lg:` only,
+// so on a phone those were not reachable at ALL. One chip, one sheet, every
+// filter in it.
+const invFiltersOpen = ref(false);
+// Sort counts here where it doesn't on the desktop toolbar: down there the
+// dropdown shows its own state, in a closed sheet nothing does.
+const invFilterCount = computed(
+  () =>
+    (invSearch.value.trim() ? 1 : 0) +
+    (invOrigin.value !== "all" ? 1 : 0) +
+    (invRarity.value ? 1 : 0) +
+    (invSort.value !== DEFAULT_SORT ? 1 : 0) +
+    invModels.value.length +
+    invTypes.value.length,
+);
+function resetInvFilters() {
+  clearInvFilters();
+  invSort.value = DEFAULT_SORT;
+  invDir.value = loadDir("inv", DEFAULT_SORT);
+}
+const invFilterSheetSwipe = swipeToDismiss(() => (invFiltersOpen.value = false));
 watch(invOrigin, () => nextTick(() => invOriginPill.sync(invOrigin.value)));
+// ---- how tall are we, really ------------------------------------------------
+// The app's height is `100dvh - 6rem`, where 6rem is an ASSUMPTION about the
+// host chrome above us (breadcrumb + page padding). It holds on desktop. On a
+// phone the host header is shorter, so we subtract more than we should and the
+// app stops short of the bottom — a dead band under the picker sheet that no
+// amount of padding-hunting inside the plugin can explain, because it isn't
+// inside the plugin.
+//
+// So measure where we actually begin. Read after paint, and sanity-checked
+// against a runaway value: if the number looks wrong we keep the 6rem guess
+// rather than rendering an app taller than the window.
+const appRootEl = ref<HTMLElement | null>(null);
+const appTopPx = ref(0);
+function measureAppTop() {
+  const el = appRootEl.value;
+  if (!el) return;
+  const top = Math.round(el.getBoundingClientRect().top);
+  appTopPx.value = top >= 0 && top < window.innerHeight * 0.5 ? top : 0;
+}
+onMounted(() => {
+  requestAnimationFrame(measureAppTop);
+  window.addEventListener("resize", measureAppTop);
+});
+onBeforeUnmount(() => window.removeEventListener("resize", measureAppTop));
+/** Compact only: desktop's 6rem is correct there and well tested. */
+const appHeightStyle = computed(() =>
+  isCompact.value && !embedMode.value && appTopPx.value > 0
+    ? { height: `calc(100dvh - ${appTopPx.value}px)` }
+    : {},
+);
+
 const cardSize = ref(Number(localStorage.getItem("cs2inv.cardSize")) || 164);
-watch(cardSize, (v) => localStorage.setItem("cs2inv.cardSize", String(v)));
+watch(cardSize, (v) => {
+  localStorage.setItem("cs2inv.cardSize", String(v));
+  invFade.remeasure();
+});
 const invGridStyle = computed(() => ({
   display: "grid",
   gridTemplateColumns: `repeat(auto-fill, minmax(${cardSize.value}px, 1fr))`,
@@ -3290,17 +3807,16 @@ function openDetail(i: InventoryItem) {
   if (route.value.name === "item" && route.value.id === String(i.id)) return;
   openModalRoute(`/items/${i.id}`);
 }
-// Where this item would land, spelled out ("Rifles · Slot 2") so the equip
-// button says what it will actually do.
+// Whether this item can go into the loadout at all, and where. The button
+// itself just says "Equip" — the modal's name plate is already showing the
+// weapon a few pixels away, and spelling out "AK-47 · Rifles" inside the button
+// made it the widest thing in the footer without answering a question anyone
+// had. `pos` is still the destination the equip actually uses.
 const craftEquipTarget = computed(() => {
   const i = craftInst.value;
   if (!i || !viewOnly.value || !canEquipInstance(i)) return null;
   const pos = positionForInstance(i);
-  if (!pos) return null;
-  if (isSpecial(pos)) return { pos, label: ALL_SPECIALS.find((s) => s.slot === pos)?.name ?? pos };
-  const g = POSITION_GROUPS.find((x) => (x.positions as readonly string[]).includes(pos));
-  const weapon = occupantWeapon(pos)?.name ?? pos;
-  return { pos, label: g ? `${weapon} · ${g.label}` : weapon };
+  return pos ? { pos } : null;
 });
 async function craftViewEquip() {
   const i = craftInst.value;
@@ -3388,6 +3904,11 @@ const ISSUE_NEW_URL = "https://github.com/lukepolo/5stack-inventory-plugin/issue
 // looks wrong, so it reads as a footnote until hovered.
 const REPORT_LINK =
   "text-f9 uppercase tracking-cs2 text-muted-foreground/40 underline decoration-dotted underline-offset-2 transition-colors hover:text-[color:var(--acc)]";
+
+// Shape (not colour — ShareMenu keeps its own) for the item modal's header
+// actions on compact. 40px is the floor for a thumb; the desktop row is built
+// for a cursor and stays at 28.
+const MODAL_HEAD_BTN = "flex h-10 items-center gap-1.5 rounded-md border px-3 text-f11 uppercase tracking-wider";
 function issue3dHref(o: {
   weapon: string;
   finish?: string | null;
@@ -3704,8 +4225,15 @@ onBeforeUnmount(() => {
 
 // Pre-bake everything equipped in the loadout (queued, one at a time; items
 // with a stored render are skipped via a cheap HEAD check).
+//
+// Desktop only. This is ~15 bakes fired the moment the page loads, and on a
+// phone that is the single most reliable way to lose the tab — see the touch
+// budget above for why volume rather than concurrency is what kills it. Phones
+// bake on demand instead: a card whose render 404s asks for its own through
+// onRenderError, so what you actually look at still gets baked, just not the
+// whole loadout up front.
 function queueLoadoutRenders() {
-  if (!canEdit.value) return;
+  if (!canEdit.value || isCoarse.value) return;
   for (const i of inventory.value) {
     if (i.equipped.length) void generateRender(i);
   }
@@ -4182,6 +4710,7 @@ if (MDEBUG) {
        cancel the auto. -->
   <div class="-mx-1 -mb-1 flex min-w-0 flex-1 flex-col bg-background sm:-mx-4 sm:-mb-4">
   <div
+    ref="appRootEl"
     class="mx-auto flex w-full max-w-[1560px] flex-col overflow-hidden text-foreground"
     :class="[
       // Embedded we're one tab among several on a page that scrolls itself, so
@@ -4196,7 +4725,7 @@ if (MDEBUG) {
       !isCompact && !embedMode && 'min-h-[560px]',
     ]"
     :data-team="team"
-    :style="{ '--acc': accent }"
+    :style="{ '--acc': accent, ...appHeightStyle }"
   >
     <div
       v-if="staleBuild"
@@ -4223,12 +4752,17 @@ if (MDEBUG) {
     <header
       data-role="app-header"
       class="flex flex-none items-center border-b border-border"
-      :class="isCompact ? 'flex-nowrap gap-1.5 overflow-x-auto px-2 py-1.5' : 'flex-wrap gap-3 px-6 py-3'"
+      :class="isCompact ? 'flex-nowrap gap-1.5 overflow-x-auto px-2 py-1' : 'flex-wrap gap-3 px-6 py-3'"
     >
-      <div v-if="view !== 'inventory'" :ref="(el) => teamPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted p-1">
+      <!-- Compact runs the whole header at 32px instead of 36: p-0.5 on the
+           pills, h-8 on the buttons. Four pixels a control does not sound like
+           much, but this bar plus the category rail under it were eating two
+           bands off the top of a phone before any loadout showed. -->
+      <div v-if="view !== 'inventory'" :ref="(el) => teamPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted" :class="isCompact ? 'p-0.5' : 'p-1'">
         <div
           v-show="teamPill.w.value > 0"
-          class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md shadow-sm"
+          class="pointer-events-none absolute left-0 z-0 rounded-md shadow-sm"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
           :style="{
             transform: `translateX(${teamPill.x.value}px)`,
             width: teamPill.w.value + 'px',
@@ -4249,8 +4783,8 @@ if (MDEBUG) {
       </div>
       <button
         v-if="view === 'grid' || view === 'focus'"
-        class="flex h-9 items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider transition-colors"
-        :class="[isCompact ? 'px-2' : 'px-3.5', view === 'focus' ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground hover:text-foreground']"
+        class="flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider transition-colors"
+        :class="[isCompact ? 'h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground hover:text-foreground']"
         :style="view === 'focus' ? { background: accentSoft } : {}"
         :title="view === 'focus' ? 'Focused' : 'Focus'"
         @click="go(view === 'focus' ? '/' : '/focus')"
@@ -4295,7 +4829,8 @@ if (MDEBUG) {
             text="Sync from Steam — read-only: mirrors your public Steam inventory. No passwords, keys, or trades, ever."
           >
             <button
-              class="grid h-9 w-9 place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
+              class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
+              :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
               :disabled="importBusy"
               @click="runSteamImport"
             >
@@ -4309,7 +4844,8 @@ if (MDEBUG) {
             :text="gearWarnings.length ? gearWarnings.join(' · ') : 'Game-server configuration'"
           >
             <button
-              class="relative grid h-9 w-9 place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="relative grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
               @click="go('/admin')"
             >
               <Settings class="h-3.5 w-3.5" />
@@ -4324,10 +4860,11 @@ if (MDEBUG) {
         <!-- The divider earns its keep at desktop spacing; at compact gaps it's
              just another 13px between two already-distinct pills. -->
         <span v-if="user && !isCompact && !embedMode" class="h-5 w-px flex-none bg-border"></span>
-        <div v-if="!embedMode" :ref="(el) => viewPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted p-1">
+        <div v-if="!embedMode" :ref="(el) => viewPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted" :class="isCompact ? 'p-0.5' : 'p-1'">
           <div
             v-show="viewPill.w.value > 0"
-            class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+            class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
             :style="{
               transform: `translateX(${viewPill.x.value}px)`,
               width: viewPill.w.value + 'px',
@@ -4343,11 +4880,12 @@ if (MDEBUG) {
             :class="view === 'grid' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
             @click="go('/')"
           >
-            <!-- Compact labels only the ACTIVE tab. Two tabs with distinct
-                 icons plus the sliding indicator make the inactive one legible
-                 without its word, and the pair costs ~70px of a ~376px row. -->
+            <!-- Compact drops BOTH labels, not just the inactive one. Two tabs
+                 with distinct icons and a sliding indicator under the live one
+                 say which is which; the words were ~70px of a ~376px row, which
+                 is what pushed the header into scrolling sideways. -->
             <LayoutGrid class="h-3.5 w-3.5" />
-            <span v-if="!isCompact || view === 'grid'">Loadout</span>
+            <span v-if="!isCompact">Loadout</span>
           </button>
           <button
             v-if="canEdit"
@@ -4357,7 +4895,7 @@ if (MDEBUG) {
             @click="go('/items')"
           >
             <Package class="h-3.5 w-3.5" />
-            <span v-if="!isCompact || view === 'inventory'">Inventory</span>
+            <span v-if="!isCompact">Inventory</span>
             <span v-if="inventory.length" class="font-mono text-f10 text-muted-foreground">{{ inventory.length }}</span>
           </button>
         </div>
@@ -4458,6 +4996,30 @@ if (MDEBUG) {
             </button>
           </div>
         </div>
+        <!-- ============ INVENTORY TOOLBAR · COMPACT ============ -->
+        <div v-else-if="isCompact" class="flex min-h-[44px] flex-none items-center gap-2 border-b border-border px-3 py-1.5">
+          <button
+            class="flex h-8 flex-none items-center gap-1.5 rounded-md border px-2.5 text-f10 uppercase tracking-wider transition-colors"
+            :class="invFilterCount ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground'"
+            :style="invFilterCount ? { background: accentSoft } : {}"
+            @click="invFiltersOpen = true"
+          >
+            <Search v-if="invSearch" class="h-3.5 w-3.5" /><SlidersHorizontal v-else class="h-3.5 w-3.5" />
+            Filters
+            <span v-if="invFilterCount" class="font-mono text-f9">{{ invFilterCount }}</span>
+          </button>
+          <span v-if="inventory.length" class="min-w-0 truncate font-mono text-f10 text-muted-foreground/60">
+            {{ filteredInventory.length }}<template v-if="filteredInventory.length !== inventory.length">/{{ inventory.length }}</template>
+          </span>
+          <button
+            v-if="inventory.length"
+            class="ml-auto grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            title="Select multiple items"
+            @click="selectMode = true"
+          >
+            <CheckSquare class="h-3.5 w-3.5" />
+          </button>
+        </div>
         <div v-else :class="[INV_TOOLBAR, INV_TOOLBAR_PL, 'border-border']">
           <!-- The row's only elastic item: everything else is a fixed-width
                pill or dropdown, so the search field gives up width first. -->
@@ -4481,7 +5043,8 @@ if (MDEBUG) {
           <div :ref="(el) => invOriginPill.setListEl(el)" class="relative inline-flex shrink-0 items-center rounded-lg bg-muted p-1">
             <div
               v-show="invOriginPill.w.value > 0"
-              class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+              class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
               :style="{
                 transform: `translateX(${invOriginPill.x.value}px)`,
                 width: invOriginPill.w.value + 'px',
@@ -4548,6 +5111,144 @@ if (MDEBUG) {
             </button>
           </div>
         </div>
+
+        <!-- ============ INVENTORY FILTER SHEET (compact) ============
+             Deliberately the same sheet as the picker's, down to the chip
+             styling — "filters" should mean one thing in this plugin. It also
+             carries the type/model facets, which live in the `lg:` rail and so
+             had no mobile home at all before this. -->
+        <Transition enter-active-class="animate-sheet-enter" leave-active-class="animate-sheet-leave">
+        <div
+          v-if="isCompact && invFiltersOpen"
+          class="fixed inset-0 z-[998] bg-background/60"
+          @click="invFiltersOpen = false"
+        >
+          <div
+            data-role="inv-filter-sheet"
+            data-sheet
+            class="absolute inset-x-0 bottom-0 max-h-[85%] overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-card shadow-2xl"
+            :style="swipeStyle"
+            @click.stop
+          >
+            <div class="sticky top-0 z-[2] touch-none bg-card pt-1" v-on="invFilterSheetSwipe">
+              <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
+              <div class="flex items-center gap-2 border-b border-border px-4 pb-2">
+                <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">Filter inventory</span>
+                <button
+                  v-if="invFilterCount"
+                  class="ml-auto rounded-md border border-border px-2 py-1 text-f9 uppercase tracking-cs1 text-muted-foreground"
+                  @click="resetInvFilters"
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+
+            <div class="flex flex-col gap-4 px-4 pb-5 pt-3">
+              <div class="relative">
+                <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  v-model="invSearch"
+                  placeholder="Search inventory…"
+                  class="h-10 w-full rounded-md border border-border bg-background pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
+                />
+                <button
+                  v-if="invSearch"
+                  class="absolute right-1 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded text-muted-foreground"
+                  title="Clear search"
+                  @click="invSearch = ''"
+                ><X class="h-3.5 w-3.5" /></button>
+              </div>
+
+              <section class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Origin</div>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    v-for="f in ORIGIN_FILTERS"
+                    :key="f[0]"
+                    :class="[INV_CHIP, invOrigin === f[0] ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    :style="invOrigin === f[0] ? { background: accentSoft } : {}"
+                    @click="invOrigin = f[0]"
+                  >{{ f[1] }}</button>
+                </div>
+              </section>
+
+              <section v-if="invRarityFacets.length" class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Rarity</div>
+                <div class="flex flex-wrap gap-2">
+                  <button :class="[INV_CHIP, !invRarity ? INV_CHIP_ON : INV_CHIP_OFF]" @click="invRarity = ''">All</button>
+                  <button
+                    v-for="r in invRarityFacets"
+                    :key="r.hex"
+                    :class="[INV_CHIP, 'gap-1.5', invRarity === r.hex ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    @click="invRarity = invRarity === r.hex ? '' : r.hex"
+                  >
+                    <span class="h-2 w-2 flex-none rounded-full" :style="{ background: r.hex }"></span>{{ r.name }}
+                  </button>
+                </div>
+              </section>
+
+              <section class="flex flex-col gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Sort</span>
+                  <SortDirection v-model="invDir" :kind="SORT_DIR_KIND[invSort]" :hint="SORT_DIR_HINT[invSort][invDir]" class="ml-auto" />
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    v-for="s in SORTS"
+                    :key="s[0]"
+                    :class="[INV_CHIP, invSort === s[0] ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    @click="setInvSort(s[0])"
+                  >{{ s[0] === 'default' ? 'Newest' : s[1] }}</button>
+                </div>
+              </section>
+
+              <!-- The rail's facets. Groups toggle the whole category, the
+                   tiles under them toggle one model — same additive rule as the
+                   desktop rail, just laid out as chips. -->
+              <section v-for="grp in invRail.weapons" :key="grp.key" class="flex flex-col gap-2">
+                <button class="flex items-center gap-2 text-left" @click="toggleType(grp.key)">
+                  <span class="text-f9 uppercase tracking-cs2" :class="invTypes.includes(grp.key) ? 'text-[color:var(--acc)]' : 'text-muted-foreground/60'">{{ grp.label }}</span>
+                  <span class="font-mono text-f9 text-muted-foreground/50">{{ grp.count }}</span>
+                </button>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    v-for="it in grp.items"
+                    :key="it.model"
+                    :class="[INV_CHIP, 'gap-1.5', invModels.includes(it.model) ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    @click="toggleModel(it.model)"
+                  >
+                    {{ it.name }}<span class="font-mono text-f8 text-muted-foreground/50">{{ it.count }}</span>
+                  </button>
+                </div>
+              </section>
+
+              <section v-if="invRail.gear.length" class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Gear</div>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    v-for="row in invRail.gear"
+                    :key="row.key"
+                    :class="[INV_CHIP, 'gap-1.5', invTypes.includes(row.key) ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    @click="toggleType(row.key)"
+                  >
+                    {{ row.label }}<span class="font-mono text-f8 text-muted-foreground/50">{{ row.count }}</span>
+                  </button>
+                </div>
+              </section>
+
+              <button
+                class="mt-1 w-full rounded-md border border-[color:var(--acc)] py-2.5 text-f11 font-semibold uppercase tracking-cs2 text-foreground"
+                :style="{ background: accentSoft }"
+                @click="invFiltersOpen = false"
+              >
+                Show {{ filteredInventory.length }} item{{ filteredInventory.length === 1 ? '' : 's' }}
+              </button>
+            </div>
+          </div>
+        </div>
+        </Transition>
+
         <div class="flex min-h-0 flex-1 overflow-hidden">
         <!-- Filter rail: the same visual language as the focus view's slot rail,
              because it answers the same question — "which of my things?" — and
@@ -4635,12 +5336,18 @@ if (MDEBUG) {
         <!-- TransitionGroup: filter/search changes slide the surviving cards
              into their new spots instead of reflowing in one frame. Leaving
              cards go instantly (no leave classes) so the grid never jams. -->
+        <!-- Wrapper exists purely to anchor the fade: the grid itself is the
+             scroller, so the overlay cannot live inside it (it would scroll
+             with the content) and the row above holds the filter rail too. -->
+        <div :ref="invFade.setHost" class="relative flex min-w-0 flex-1">
         <TransitionGroup
+          data-scroller
           tag="div"
           class="min-w-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto p-6"
           :style="invGridStyle"
           move-class="inv-move"
           enter-active-class="animate-fade-in"
+          @scroll.passive="invFade.onScroll"
         >
           <div v-if="!inventory.length" key="empty" class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground">
             <Package class="h-8 w-8 opacity-40" />
@@ -4690,6 +5397,13 @@ if (MDEBUG) {
             @hit="inventoryWindow.grow"
           />
         </TransitionGroup>
+        <!-- Same cue as the picker sheet: the grid runs off the edge rather
+             than ending flush against it, and the fade clears at the bottom. -->
+        <div
+          v-if="invFade.more.value"
+          class="pointer-events-none absolute inset-x-0 bottom-0 z-[2] h-12 bg-gradient-to-t from-background via-background/70 to-transparent"
+        ></div>
+        </div>
         </div>
       </div>
 
@@ -4782,11 +5496,11 @@ if (MDEBUG) {
           @pointercancel="cancelLongPress"
           @click.capture="onSlotClickCapture"
         >
-          <nav class="flex flex-none gap-1 overflow-x-auto border-b border-border px-2 py-1" data-role="compact-rail">
+          <nav class="flex flex-none gap-1 overflow-x-auto border-b border-border px-2 py-0.5" data-role="compact-rail">
             <button
               v-for="c in compactCats"
               :key="c.key"
-              class="flex min-h-[34px] flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-md border px-2 text-f10 font-semibold uppercase tracking-cs1 transition-colors"
+              class="flex min-h-[30px] flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-md border px-2 text-f10 font-semibold uppercase tracking-cs1 transition-colors"
               :class="compactCat === c.key
                 ? 'border-[color:var(--acc)] text-foreground'
                 : 'border-border/60 text-muted-foreground'"
@@ -4893,9 +5607,13 @@ if (MDEBUG) {
               </button>
             </div>
 
-            <!-- Discoverability for long-press, retired once it's been used —
-                 a permanent hint costs a row of scroll on every visit. -->
-            <p v-if="!hasLongPressed" class="px-1 pt-2 text-center text-f9 uppercase tracking-cs2 text-muted-foreground/50">
+            <!-- Permanent, not retired-after-first-use. It used to hide itself
+                 the moment you long-pressed once, on the theory that a standing
+                 hint costs a row of scroll — but long-press has no other
+                 affordance, so the one time it showed was the one time you
+                 weren't looking for it. One dim 9px line is a cheap price for
+                 the only place the gesture is ever named. -->
+            <p class="px-1 pt-2 text-center text-f9 uppercase tracking-cs2 text-muted-foreground/50">
               Tap to select · hold for options
             </p>
           </div>
@@ -5206,7 +5924,8 @@ if (MDEBUG) {
                 <div v-if="focus3dAvailable" :ref="(el) => focus3dPill.setListEl(el)" class="relative flex h-8 items-center rounded-lg bg-muted p-1">
                   <div
                     v-show="focus3dPill.w.value > 0"
-                    class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+                    class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
                     :style="{
                       transform: `translateX(${focus3dPill.x.value}px)`,
                       width: focus3dPill.w.value + 'px',
@@ -5362,20 +6081,23 @@ if (MDEBUG) {
       <section
         v-if="!viewerId"
         data-role="picker-sheet"
-        class="flex flex-col border-t border-border"
-        :class="isCompact ? 'min-h-0 flex-none' : 'absolute inset-x-0 bottom-0 z-[5] bg-background'"
+        class="absolute inset-x-0 bottom-0 z-[5] flex flex-col border-t border-border bg-background"
         :style="sheetStyle"
       >
-        <!-- Grab handle: the only affordance telling a touch user this panel
-             resizes. Pointer-captured so the drag survives leaving the strip. -->
-        <div
-          v-if="isCompact"
-          class="flex flex-none cursor-grab touch-none justify-center py-2"
-          @pointerdown="onSheetDragStart"
-          @pointermove="onSheetDragMove"
-          @pointerup="onSheetDragEnd"
-          @pointercancel="onSheetDragEnd"
-        >
+        <!-- ============ SHEET HEADER (compact: the drag surface) ============
+             The ENTIRE header drags — pill, toolbar and tally together, not
+             just the pill. A 20px pill is not a target anyone hits on a phone,
+             and a swipe that misses it lands on the page, where the browser
+             takes it as pull-to-refresh. `touch-none` is what denies the
+             browser that gesture, and it only works on the element the finger
+             actually starts on — hence the whole block.
+             Capture is lazy (SWIPE_ARM_PX), so the mode tabs and filter chip
+             living inside this surface keep their taps. -->
+        <div class="flex-none" :class="isCompact && 'touch-none'" v-on="sheetHeaderDrag">
+        <!-- Handle + toolbar. This wrapper's height IS the minimised state —
+             see setSheetPeekEl. Nothing else may go inside it. -->
+        <div :ref="setSheetPeekEl">
+        <div v-if="isCompact" class="flex cursor-grab justify-center py-2.5">
           <span class="h-1 w-10 rounded-full bg-muted-foreground/40"></span>
         </div>
         <!-- Desktop never wraps. A second row here costs ~40px of picker for one
@@ -5394,7 +6116,8 @@ if (MDEBUG) {
           <div :ref="(el) => sheetPill.setListEl(el)" class="relative inline-flex flex-none items-center rounded-lg bg-muted p-1">
             <div
               v-show="sheetPill.w.value > 0"
-              class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+              class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
               :style="{
                 transform: `translateX(${sheetPill.x.value}px)`,
                 width: sheetPill.w.value + 'px',
@@ -5468,7 +6191,8 @@ if (MDEBUG) {
           >
             <div
               v-show="sheetOriginPill.w.value > 0"
-              class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+              class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
               :style="{
                 transform: `translateX(${sheetOriginPill.x.value}px)`,
                 width: sheetOriginPill.w.value + 'px',
@@ -5543,6 +6267,28 @@ if (MDEBUG) {
             <span v-if="sheetFilterCount" class="font-mono text-f9">{{ sheetFilterCount }}</span>
           </button>
         </div>
+        </div>
+        <!-- /measured minimised height -->
+
+        <!-- Compact-only tally. A phone can't show a scrollbar, and the picker
+             is a short scroller inside a sheet inside a page — so how many
+             results there are, and whether you've seen them all, has to be
+             said out loud rather than implied by the geometry. -->
+        <div
+          v-if="isCompact"
+          class="flex flex-none items-center justify-between gap-2 border-b border-border px-3 py-1.5 text-f9 uppercase tracking-cs1 text-muted-foreground"
+        >
+          <span class="truncate">
+            <span class="font-mono text-foreground">{{ sheetResultCount }}</span>
+            {{ sheetMode === 'craft' ? 'finishes' : sheetMode === 'replace' ? 'weapons' : sheetResultCount === 1 ? 'skin' : 'skins' }}
+            · {{ sheetWeaponName }}
+          </span>
+          <span v-if="sheetHasMore" class="flex flex-none items-center gap-1 text-muted-foreground/70">
+            Scroll <ChevronDown class="h-3 w-3" />
+          </span>
+        </div>
+        </div>
+        <!-- /sheet header -->
 
         <!-- ============ COMPACT FILTER SHEET ============
              Search + every facet as flat tappable chips. Deliberately NOT the
@@ -5557,11 +6303,15 @@ if (MDEBUG) {
         >
           <div
             data-role="filter-sheet"
-            class="absolute inset-x-0 bottom-0 max-h-[85%] overflow-y-auto rounded-t-2xl border-t border-border bg-card shadow-2xl"
+            data-sheet
+            class="absolute inset-x-0 bottom-0 max-h-[85%] overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-card shadow-2xl"
+            :style="swipeStyle"
             @click.stop
           >
-            <div class="sticky top-0 z-[2] bg-card pt-2">
-              <div class="flex justify-center pb-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
+            <!-- Whole header grabs, Reset included — the lazy capture in
+                 swipeToDismiss keeps that button's tap working. -->
+            <div class="sticky top-0 z-[2] touch-none bg-card pt-1" v-on="filterSheetSwipe">
+              <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
               <div class="flex items-center gap-2 border-b border-border px-4 pb-2">
                 <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">Filter · {{ sheetWeaponName }}</span>
                 <button
@@ -5691,19 +6441,22 @@ if (MDEBUG) {
         >
         <div
           :key="sheetMode + '|' + sheetKey"
-          class="flex-1 auto-rows-min content-start gap-2.5 overflow-y-auto pb-6 pt-3.5"
-          :class="isCompact ? 'px-3' : 'px-6'"
+          :ref="setSheetScrollEl"
+          class="flex-1 auto-rows-min content-start overflow-y-auto overscroll-contain"
+          :class="isCompact ? 'gap-1.5 px-3 pb-8 pt-2' : 'gap-2.5 px-6 pb-6 pt-3.5'"
           :style="pickerGridStyle"
+          @scroll.passive="onSheetScroll"
         >
           <!-- OWNED: your skins for the slot's weapon -->
           <template v-if="sheetMode === 'owned'">
             <button
               data-role="craft-tile"
-              class="animate-sheet-in flex h-full flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]"
+              class="animate-sheet-in flex items-center justify-center gap-2 rounded-lg border-2 border-dashed border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]"
+              :class="sheetRows ? 'w-full px-2.5 py-2' : 'h-full flex-col'"
               :style="{ '--i': 0 }"
               @click="sheetMode = 'craft'"
             >
-              <Plus class="h-6 w-6" />
+              <Plus :class="sheetRows ? 'h-4 w-4 flex-none' : 'h-6 w-6'" />
               <span class="max-w-full truncate px-2 text-f11 font-semibold uppercase tracking-wider">Craft {{ sheetWeaponName }}</span>
             </button>
             <!-- Stock/default item for special slots (agent, knife, gloves,
@@ -5711,29 +6464,31 @@ if (MDEBUG) {
             <button
               v-if="isSpecial(selected) && specialDefault(selected)"
               data-role="skin"
-              class="animate-sheet-in relative flex h-full flex-col overflow-hidden rounded-lg border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-muted-foreground/40"
-              :class="!isSkinned(rowFor(selected)) ? 'border-[color:var(--acc)]' : 'border-border'"
+              class="animate-sheet-in relative overflow-hidden rounded-lg border bg-card text-left transition-colors hover:border-muted-foreground/40"
+              :class="[SHEET_ENTRY, !isSkinned(rowFor(selected)) ? 'border-[color:var(--acc)]' : 'border-border']"
               :style="{ '--i': 1 }"
               @click="clearSlot(selected)"
             >
-              <div :class="CARD_ART">
+              <div :class="SHEET_ART">
                 <img :src="specialDefault(selected)?.image ?? undefined" alt="" class="max-h-full max-w-full object-contain opacity-80" />
               </div>
-              <div class="truncate text-f13 font-medium text-muted-foreground">{{ specialDefault(selected)?.name ?? 'Default' }}</div>
-              <div class="text-f9 uppercase tracking-cs1 text-muted-foreground/60">Default · {{ isShared(selected) ? 'CT + T' : team }}</div>
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-f13 font-medium text-muted-foreground">{{ specialDefault(selected)?.name ?? 'Default' }}</div>
+                <div class="text-f9 uppercase tracking-cs1 text-muted-foreground/60">Default · {{ isShared(selected) ? 'CT + T' : team }}</div>
+              </div>
             </button>
             <button
               v-if="isWeaponPos(selected) && occupantWeapon(selected)"
               data-role="skin"
-              class="animate-sheet-in relative flex h-full flex-col overflow-hidden rounded-lg border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-muted-foreground/40"
-              :class="!isSkinned(rowFor(selected)) ? 'border-[color:var(--acc)]' : 'border-border'"
+              class="animate-sheet-in relative overflow-hidden rounded-lg border bg-card text-left transition-colors hover:border-muted-foreground/40"
+              :class="[SHEET_ENTRY, !isSkinned(rowFor(selected)) ? 'border-[color:var(--acc)]' : 'border-border']"
               :style="{ '--i': 1 }"
               @click="equipDefaultAt(occupantWeapon(selected)!, selected)"
             >
-              <div :class="CARD_ART">
+              <div :class="SHEET_ART">
                 <img :src="occupantWeapon(selected)!.image ?? undefined" alt="" class="max-h-full max-w-full object-contain opacity-70" />
               </div>
-              <div class="truncate text-f13 font-medium text-muted-foreground">Default</div>
+              <div class="min-w-0 flex-1 truncate text-f13 font-medium text-muted-foreground">Default</div>
             </button>
             <!-- draggable: drop it on any eligible loadout slot (grid, rail,
                  focus rail) — clicking still equips into the selected slot.
@@ -5751,8 +6506,9 @@ if (MDEBUG) {
               @dragend="onTileDragEnd"
               strip-weapon-name
               show-header
+              :row="sheetRows"
               :active="String(rowFor(selected)?.item_instance_id) === String(i.id)"
-              @click="isCoarse ? openItemCtxFor(i) : equipInstanceAt(i, selected)"
+              @click="tapOpensMenu ? openItemCtxFor(i) : equipInstanceAt(i, selected)"
               @contextmenu.prevent="openItemCtx(i, $event)"
             @longpress="openItemCtxFor(i)"
               @view3d="view3dForInstance(i)"
@@ -5808,31 +6564,37 @@ if (MDEBUG) {
               v-for="(w, idx) in replaceOptions.defaults"
               :key="w.model"
               data-role="skin"
-              class="animate-sheet-in relative flex h-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
+              class="animate-sheet-in relative overflow-hidden rounded-lg border border-border bg-card text-left transition-colors hover:border-[color:var(--acc)]"
+              :class="SHEET_ENTRY"
               :style="{ '--i': idx }"
               @click="equipDefaultAt(w, selected)"
             >
-              <div :class="CARD_ART">
+              <div :class="SHEET_ART">
                 <img :src="w.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain opacity-80" />
               </div>
-              <div class="truncate text-f13 font-medium">{{ w.name }}</div>
-              <div class="mt-0.5 text-f8 uppercase tracking-wider text-muted-foreground/60">Default</div>
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-f13 font-medium">{{ w.name }}</div>
+                <div class="mt-0.5 text-f8 uppercase tracking-wider text-muted-foreground/60">Default</div>
+              </div>
             </button>
             <button
               v-for="(i, idx) in replaceOptions.owned"
               :key="'own' + i.id"
               data-role="skin"
-              class="animate-sheet-in relative flex h-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
-              :style="[{ '--i': replaceOptions.defaults.length + idx }, i.item?.rarity ? { borderBottom: `3px solid ${i.item.rarity}` } : {}]"
+              class="animate-sheet-in relative overflow-hidden rounded-lg border border-border bg-card text-left transition-colors hover:border-[color:var(--acc)]"
+              :class="SHEET_ENTRY"
+              :style="[
+                { '--i': replaceOptions.defaults.length + idx },
+                i.item?.rarity ? (sheetRows ? { borderLeft: `3px solid ${i.item.rarity}` } : { borderBottom: `3px solid ${i.item.rarity}` }) : {},
+              ]"
               @click="equipInstanceAt(i, selected)"
               @contextmenu.prevent="openItemCtx(i, $event)"
-            @longpress="openItemCtxFor(i)"
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(i.item?.rarity, 0.22)"></span>
-              <div :class="CARD_ART">
+              <div :class="[SHEET_ART, 'relative z-[2]']">
                 <img :src="i.item?.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain" />
               </div>
-              <div class="relative z-[2] flex items-center gap-1.5">
+              <div class="relative z-[2] flex min-w-0 flex-1 items-center gap-1.5">
                 <span class="truncate text-f13 font-medium">{{ itemName(i.item) }}</span>
                 <span v-if="i.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
               </div>
@@ -5846,6 +6608,18 @@ if (MDEBUG) {
           </template>
         </div>
         </Transition>
+
+        <!-- A fade over the last row so the list visibly runs off the edge
+             instead of ending flush against it. Clears when you reach the
+             bottom, so it never lies.
+             Desktop too: the picker is a short scroller inside a panel there
+             as well, and "is that everything?" is the same question at any
+             width — the scrollbar answers it only if you go looking. -->
+        <div
+          v-if="sheetHasMore"
+          class="pointer-events-none absolute inset-x-0 bottom-0 z-[2] bg-gradient-to-t from-background via-background/70 to-transparent"
+          :class="isCompact ? 'h-10' : 'h-12'"
+        ></div>
       </section>
       </div>
     </Transition>
@@ -5882,15 +6656,35 @@ if (MDEBUG) {
          attachment picker up it closes back to the editor rather than throwing the
          whole craft away. Dismissing a picker must never discard the edit behind
          it — that's a lost sticker placement, not a closed dialog. -->
-    <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm" @click.self="picker ? (picker = null) : closeCraft()">
-      <div class="relative flex h-[min(92vh,940px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in">
-        <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
+    <!-- Compact goes edge to edge: the inset, the rounding and the border are
+         desktop affordances that say "this is a layer over your inventory".
+         On a phone there is nothing else on screen for it to be a layer OVER,
+         so all they did was spend ~70px of width and ~100px of height — most
+         of it out of the 3D viewer, which is the whole reason to open this. -->
+    <div
+      v-if="craft"
+      class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 backdrop-blur-sm"
+      :class="isCompact ? 'p-0' : 'p-4'"
+      @click.self="picker ? (picker = null) : closeCraft()"
+    >
+      <div
+        class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
+        :class="isCompact
+          ? 'h-full w-full'
+          : 'h-[min(92vh,940px)] w-[min(96vw,1320px)] rounded-lg border border-border'"
+      >
+        <div class="flex items-center justify-between border-b border-border" :class="isCompact ? 'gap-2 px-3 py-2' : 'px-4 py-2.5'">
           <!-- Provenance and where it's equipped belong to the item's IDENTITY,
                not its spec — "this is your Steam one, and it's on T" is part of
                answering "which item am I looking at". So they ride with the name
                rather than sitting in the readout column with wear and pattern. -->
           <span v-if="viewOnly" class="flex min-w-0 items-center gap-2">
-            <ItemName :item="craft.skin" class="min-w-0 truncate" name-class="text-f13 font-semibold uppercase tracking-cs1" />
+            <!-- Compact drops the name: the plate under the model already
+                 carries it, and a second copy up here was buying a duplicate
+                 with the room the action buttons need to be thumb-sized. The
+                 provenance icon and equip dots stay — those appear nowhere
+                 else on this screen. -->
+            <ItemName v-if="!isCompact" :item="craft.skin" class="min-w-0 truncate" name-class="text-f13 font-semibold uppercase tracking-cs1" />
             <!-- Provenance stays an ICON while equip state is dots. It was a dot
                  too for one revision, and Steam blue (#66c0f4) against CT blue
                  (#7ea6ff) is not a distinction anyone can make — "synced" read as
@@ -5934,30 +6728,45 @@ if (MDEBUG) {
             >
               <ExternalLink class="h-3 w-3" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
             </button>
-            <ShareMenu :links="craftShareLinks" :note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE" />
+            <ShareMenu
+              :links="craftShareLinks"
+              :note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE"
+              :btn-class="isCompact ? MODAL_HEAD_BTN : undefined"
+            />
             <!-- Destructive, so it keeps its distance from the action row at the
                  bottom and lives up here beside Close, the way it did on the
                  detail modal this screen replaced. -->
             <button
               v-if="viewOnly && craftInst && canEdit"
-              class="grid h-7 w-7 place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
+              class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
+              :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
               title="Delete from inventory"
               @click="deleteOwned(craftInst, closeCraft)"
             >
-              <Trash2 class="h-3.5 w-3.5" />
+              <Trash2 :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3.5 w-3.5'" />
             </button>
             <button
               v-if="!viewOnly"
-              class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="flex items-center gap-1.5 rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              :class="isCompact ? 'h-10 px-3 text-f11 uppercase tracking-wider' : 'px-2.5 py-1 text-f10 uppercase tracking-wider'"
               title="Reset all options"
               @click="resetCraft"
             >
-              <RotateCcw class="h-3 w-3" /> Reset
+              <RotateCcw :class="isCompact ? 'h-4 w-4' : 'h-3 w-3'" /> Reset
             </button>
-            <button class="text-muted-foreground transition-colors hover:text-foreground" @click="closeCraft()">✕</button>
+            <!-- Was a bare ✕ glyph with no box: a ~14px target, and the single
+                 most-used control on the screen. -->
+            <button
+              class="grid place-items-center rounded-md text-muted-foreground transition-colors hover:text-foreground"
+              :class="isCompact ? 'h-10 w-10 border border-border' : 'h-7 w-7'"
+              title="Close"
+              @click="closeCraft()"
+            >
+              <X :class="isCompact ? 'h-5 w-5' : 'h-4 w-4'" />
+            </button>
           </div>
         </div>
-        <div class="flex min-h-0 flex-1 flex-wrap gap-5 overflow-y-auto p-5">
+        <div class="flex min-h-0 flex-1 flex-wrap overflow-y-auto" :class="isCompact ? 'gap-3 p-2' : 'gap-5 p-5'">
           <!-- Preview -->
           <div class="flex min-w-[220px] flex-1 flex-col items-center justify-center gap-2">
             <div class="relative flex min-h-[320px] w-full flex-1 items-center justify-center">
@@ -5994,7 +6803,8 @@ if (MDEBUG) {
               <div v-if="modal3dAvailable" :ref="(el) => modal3dPill.setListEl(el)" class="absolute left-0 top-0 z-[3] inline-flex items-center rounded-lg bg-muted p-1">
                 <div
                   v-show="modal3dPill.w.value > 0"
-                  class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+                  class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
                   :style="{
                     transform: `translateX(${modal3dPill.x.value}px)`,
                     width: modal3dPill.w.value + 'px',
@@ -6014,35 +6824,51 @@ if (MDEBUG) {
                 >{{ m[1] }}</button>
               </div>
             </div>
-            <!-- Footer row. Report link, name plate and controls legend all
-                 sit on ONE baseline instead of each floating at its own height
-                 in its own column. The name keeps the centre column so it stays
-                 optically centred under the model however wide the sides get. -->
-            <div class="mb-3 grid w-full grid-cols-[1fr_auto_1fr] items-end gap-3 pb-1">
-              <a
-                v-if="modal3d"
-                :href="craftReportHref"
-                target="_blank"
-                rel="noopener noreferrer"
-                :class="['col-start-1 justify-self-start', REPORT_LINK]"
-                title="Open a GitHub issue pre-filled with this item's details"
-              >
-                Report a problem
-              </a>
-              <div class="col-start-2 text-center">
-                <div class="mx-auto mb-1.5 h-px w-28" :style="{ background: `linear-gradient(90deg, transparent, ${craft.skin.rarity}, transparent)` }"></div>
+            <!-- Footer. The report link used to hold a column of its own on the
+                 same baseline as the name and the controls legend, which meant
+                 the name — the one thing here anyone reads — was squeezed
+                 between two pieces of chrome and truncated first. It now stacks
+                 ABOVE the controls in the right-hand column, so the name plate
+                 gets the width back and stays optically centred under the
+                 model. -->
+            <!-- Desktop keeps the three-column baseline so the name plate stays
+                 optically centred under the model with the chrome beside it.
+                 Compact STACKS: at phone width the centre column collapses to
+                 whatever's left after the controls legend, which pushed the
+                 name into a narrow ribbon with dead space either side of it.
+                 Full width each, name first — it's the line people read. -->
+            <div
+              class="w-full"
+              :class="isCompact
+                ? 'mb-1 flex flex-col gap-1.5'
+                : 'mb-3 grid grid-cols-[1fr_auto_1fr] items-end gap-3 pb-1'"
+            >
+              <div :class="isCompact ? 'w-full text-center' : 'col-start-2 text-center'">
+                <div class="mx-auto mb-1.5 h-px" :class="isCompact ? 'w-40' : 'w-28'" :style="{ background: `linear-gradient(90deg, transparent, ${craft.skin.rarity}, transparent)` }"></div>
                 <div class="text-f11 uppercase tracking-cs1 text-muted-foreground">{{ editingId != null || duplicating ? (weaponByModel.get(craftModel ?? '')?.name ?? sheetWeaponName) : sheetWeaponName }}</div>
                 <ItemName :item="craft.skin" strip name-class="text-f13 font-semibold" :style="{ color: craft.skin.rarity }" />
               </div>
               <!-- Controls legend. Overlaying the model put it on top of the
                    thing being dragged; on the footer baseline it sits out of the
-                   way but still in eyeline. -->
-              <ViewerControls
+                   way but still in eyeline. Compact spreads report and legend to
+                   opposite ends of their own full-width row. -->
+              <div
                 v-if="modal3d"
-                class="col-start-3 justify-self-end"
-                :edit="!viewOnly"
-                :rotate="craft.stickers.some(Boolean)"
-              />
+                :class="isCompact
+                  ? 'flex w-full items-center justify-between gap-3'
+                  : 'col-start-3 flex flex-col items-end gap-1 justify-self-end'"
+              >
+                <a
+                  :href="craftReportHref"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  :class="REPORT_LINK"
+                  title="Open a GitHub issue pre-filled with this item's details"
+                >
+                  Report a problem
+                </a>
+                <ViewerControls :edit="!viewOnly" :rotate="craft.stickers.some(Boolean)" />
+              </div>
             </div>
           </div>
           <!-- Options (edit) / spec (view). Same column, same boxes, same
@@ -6051,9 +6877,13 @@ if (MDEBUG) {
                a view↔edit flip mounts a fresh set of boxes — without the gate
                they replay the staggered entrance from opacity:0 and the column
                goes blank mid-flip. The cascade belongs to the modal OPENING. -->
+          <!-- The 300px cap is a READING-WIDTH cap for the desktop two-column
+               layout, where this column sits beside the preview. On compact it
+               wraps under the preview and owns the whole modal, so the cap just
+               left a dead gutter down the right-hand side. -->
           <div
-            class="flex w-full max-w-[300px] flex-none flex-col gap-2.5"
-            :class="{ 'sheet-settled': craftSettled }"
+            class="flex w-full flex-none flex-col gap-2.5"
+            :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px]']"
           >
             <template v-if="!viewOnly">
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
@@ -6181,6 +7011,21 @@ if (MDEBUG) {
                 </button>
                 <span v-if="craft.charm" class="truncate text-f10 text-muted-foreground">{{ craft.charm.name }}</span>
               </div>
+              <!-- A charm carries its own pattern, exactly as the weapon does,
+                   and it is a tradeable attribute rather than a placement
+                   detail — so it sits with the charm itself and NOT behind
+                   Advanced with the x/y/z nudges. Same label / field / die
+                   rhythm as the weapon's Pattern row so the two read as the
+                   same control for the same idea. -->
+              <div v-if="craft.charm" class="mt-2 flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                <input
+                  v-model.number="craft.charm.seed"
+                  type="number" min="0" max="100000" placeholder="0"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                />
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random charm pattern" @click="randomCharmSeed">🎲</button>
+              </div>
               <div v-if="craft.charm && advancedPlacement" class="mt-1.5 flex items-center gap-1.5">
                 <span class="w-4 flex-none"></span>
                 <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">X
@@ -6208,12 +7053,17 @@ if (MDEBUG) {
             </label>
             <div v-if="!['agent', 'musickit', 'graffiti'].includes(selected)" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
               <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+              <!-- flex-1, not a fixed width: Pattern sat at w-24 and Wear at
+                   w-28, so two stacked rows with the same label column ended in
+                   fields of different lengths and a pocket of dead space before
+                   each die. Filling the row is what the Name tag input above
+                   already does — this makes the whole stack one column. -->
               <input
                 v-model.number="craft.seed"
                 type="number" min="1" max="1000"
-                class="h-9 w-24 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
               />
-              <button class="ml-auto grid h-9 w-9 place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random pattern" @click="randomSeed">🎲</button>
+              <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random pattern" @click="randomSeed">🎲</button>
             </div>
             <div v-if="!['agent', 'musickit', 'graffiti'].includes(selected)" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
               <div class="flex items-center gap-2">
@@ -6221,9 +7071,9 @@ if (MDEBUG) {
                 <input
                   v-model.number="craft.wear"
                   type="number" min="0" max="1" step="0.0001"
-                  class="h-9 w-28 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
                 />
-                <button class="ml-auto grid h-9 w-9 place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random wear" @click="randomWear">🎲</button>
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random wear" @click="randomWear">🎲</button>
               </div>
               <div class="mt-2 flex items-center gap-2">
                 <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
@@ -6348,7 +7198,8 @@ if (MDEBUG) {
             >
               <div
                 v-show="pickerGroupPill.w.value > 0"
-                class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
+                class="pointer-events-none absolute left-0 z-0 rounded-md"
+          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
                 :style="{
                   transform: `translateX(${pickerGroupPill.x.value}px)`,
                   width: pickerGroupPill.w.value + 'px',
@@ -6462,7 +7313,7 @@ if (MDEBUG) {
         <!-- Same row, same positions in both modes: dismiss on the left, the
              commit on the right. Editing commits a change to the item; viewing
              commits it to your loadout — so Equip inherits Save's slot. -->
-        <div class="flex items-center justify-end gap-3 border-t border-border px-5 py-3.5">
+        <div class="flex items-center justify-end border-t border-border" :class="isCompact ? 'gap-2 px-3 py-2.5' : 'gap-3 px-5 py-3.5'">
           <button class="rounded px-4 py-2 text-f13 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground" @click="closeCraft()">{{ viewOnly ? 'Close' : 'Cancel' }}</button>
           <!-- Edit is secondary here: it changes the item, but equipping it is
                what you came to decide. -->
@@ -6483,7 +7334,7 @@ if (MDEBUG) {
             :title="craftEquipTarget ? 'Equip on ' + team : 'Not usable by ' + team"
             @click="craftViewEquip"
           >
-            <template v-if="craftEquipTarget">Equip · {{ craftEquipTarget.label }}</template>
+            <template v-if="craftEquipTarget">Equip</template>
             <template v-else>Not usable by {{ team }}</template>
           </button>
           <!-- Signed out the editor stays fully live — only the commit is off.
@@ -6499,7 +7350,7 @@ if (MDEBUG) {
             title="Save these changes as a new item, leaving the original untouched"
             @click="duplicateCraft"
           >
-            <Copy class="h-3.5 w-3.5" /> Save as copy
+            <Copy class="h-3.5 w-3.5" /> Copy
           </button>
           <button
             v-if="!viewOnly"
@@ -6564,19 +7415,39 @@ if (MDEBUG) {
            sane left edge, which at 400px it is not. -->
       <div
         data-role="slot-menu"
+        data-sheet
         :class="isCompact
           ? 'absolute inset-x-0 bottom-0 overflow-hidden rounded-t-2xl border-t border-border bg-card shadow-2xl'
           : 'absolute min-w-[204px] origin-top-left animate-menu-in overflow-hidden rounded-md border border-border bg-card py-1 shadow-2xl'"
-        :style="isCompact ? {} : { left: (ctx?.x ?? 0) + 'px', top: (ctx?.y ?? 0) + 'px' }"
+        :style="isCompact ? swipeStyle : { left: (ctx?.x ?? 0) + 'px', top: (ctx?.y ?? 0) + 'px' }"
         @click.stop
       >
-        <div v-if="isCompact" class="flex justify-center pb-1 pt-2">
-          <span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span>
+        <!-- The WHOLE header is the grab area, pill and title together. A 20px
+             pill is not a target anyone hits on a phone, and a swipe that
+             misses it lands on the page — where the browser reads it as
+             pull-to-refresh and reloads the panel out from under you.
+             touch-none is what denies the browser that gesture; it has to be on
+             the element the finger actually starts on, hence the whole strip. -->
+        <div v-if="isCompact" class="touch-none border-b border-border" v-on="slotMenuSwipe">
+          <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
+          <div class="px-3 pb-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
+            {{ ctx ? (occupantWeapon(ctx.pos)?.name ?? ctx.pos) : '' }}
+          </div>
         </div>
-        <div class="border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
+        <div v-else class="border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
           {{ ctx ? (occupantWeapon(ctx.pos)?.name ?? ctx.pos) : '' }}
         </div>
-        <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxOwned">
+        <!-- 3D leads, same as the item menu: looking at the gun is the most
+             common reason this menu gets opened, and it's the one row that
+             never depends on what's already in the slot. -->
+        <button
+          v-if="ctx3dOk"
+          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          @click="ctxView3d"
+        >
+          <Box class="h-3.5 w-3.5" /> View in 3D
+        </button>
+        <button class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxOwned">
           <Search class="h-3.5 w-3.5" /> Pick / change skin
         </button>
         <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxCraft">
@@ -6588,13 +7459,6 @@ if (MDEBUG) {
           @click="ctxReplace"
         >
           <Replace class="h-3.5 w-3.5" /> Replace weapon…
-        </button>
-        <button
-          v-if="ctx3dOk"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
-          @click="ctxView3d"
-        >
-          <Box class="h-3.5 w-3.5" /> View in 3D
         </button>
         <button
           v-if="ctx && equippedInstance(ctx.pos) && !isCoarse"
@@ -6637,8 +7501,20 @@ if (MDEBUG) {
          so there's no spec strip and no Edit/Inspect/Share here: a default
          weapon is a model, not an item anyone owns. -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-      <div v-if="loadout3d" class="fixed inset-0 z-[998] flex items-center justify-center bg-background p-6" @click="dismissLoadout3d">
-        <div class="relative flex h-[min(88vh,900px)] w-[min(96vw,1400px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in" @click.stop>
+      <!-- Edge to edge on compact, same reasoning as the craft modal above. -->
+      <div
+        v-if="loadout3d"
+        class="fixed inset-0 z-[998] flex items-center justify-center bg-background"
+        :class="isCompact ? 'p-0' : 'p-6'"
+        @click="dismissLoadout3d"
+      >
+        <div
+          class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
+          :class="isCompact
+            ? 'h-full w-full'
+            : 'h-[min(88vh,900px)] w-[min(96vw,1400px)] rounded-lg border border-border'"
+          @click.stop
+        >
           <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
             <span class="truncate text-f11 uppercase tracking-cs3 text-muted-foreground">{{ loadout3d.name }}</span>
             <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" @click="dismissLoadout3d">
@@ -6720,43 +7596,64 @@ if (MDEBUG) {
     >
       <div
         data-role="slot-menu"
+        data-sheet
         :class="isCompact
-          ? 'absolute inset-x-0 bottom-0 max-h-[80%] overflow-y-auto rounded-t-2xl border-t border-border bg-card shadow-2xl'
+          ? 'absolute inset-x-0 bottom-0 max-h-[80%] overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-card shadow-2xl'
           : 'absolute min-w-[214px] origin-top-left animate-menu-in overflow-hidden rounded-md border border-border bg-card py-1 shadow-2xl'"
-        :style="isCompact ? {} : { left: (itemCtx?.x ?? 0) + 'px', top: (itemCtx?.y ?? 0) + 'px' }"
+        :style="isCompact ? swipeStyle : { left: (itemCtx?.x ?? 0) + 'px', top: (itemCtx?.y ?? 0) + 'px' }"
         @click.stop
       >
-        <div v-if="isCompact" class="sticky top-0 flex justify-center bg-card pb-1 pt-2">
-          <span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span>
+        <!-- Same whole-header grab area as the slot menu above. -->
+        <div v-if="isCompact" class="sticky top-0 z-[2] touch-none border-b border-border bg-card" v-on="itemMenuSwipe">
+          <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
+          <div class="truncate px-3 pb-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
+            <ItemName :item="itemCtx?.inst.item" />
+          </div>
         </div>
-        <div class="truncate border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
+        <div v-else class="truncate border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
           <ItemName :item="itemCtx?.inst.item" />
         </div>
+        <!-- 3D leads. It is the only row that always applies — every equip
+             below it can be already-done and greyed out, and looking at the
+             thing is what you came for anyway. -->
+        <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxView3d">
+          <Box class="h-3.5 w-3.5" /> View in 3D
+        </button>
+        <!-- Equip rows go DISABLED, not hidden, once the item is already on
+             that team: a menu whose rows move around between openings is worse
+             than one with a dead row, and "Equipped on CT" answers the question
+             the row would otherwise raise. -->
         <template v-if="itemCtxTeams === 'shared'">
-          <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxEquipTeams(['CT', 'T'])">
-            <Crosshair class="h-3.5 w-3.5" /> Equip (CT + T)
+          <button
+            class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="itemCtxSharedEquipped"
+            @click="ctxEquipTeams(['CT', 'T'])"
+          >
+            <Crosshair class="h-3.5 w-3.5" /> {{ itemCtxSharedEquipped ? 'Equipped (CT + T)' : 'Equip (CT + T)' }}
           </button>
         </template>
         <template v-else-if="itemCtxTeams">
           <button
-            v-for="t in itemCtxTeams"
+            v-for="(t, ti) in itemCtxTeams"
             :key="t"
-            class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+            class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+            :class="ti === 0 && 'border-t border-border'"
+            :disabled="itemCtxEquippedOn.has(t)"
             @click="ctxEquipTeams([t])"
           >
-            <Crosshair class="h-3.5 w-3.5" /> Equip on {{ t }}
+            <Crosshair class="h-3.5 w-3.5" /> {{ itemCtxEquippedOn.has(t) ? `Equipped on ${t}` : `Equip on ${t}` }}
           </button>
+          <!-- Both-teams stays live while EITHER side is still open — it's the
+               one-tap way to finish the pair. -->
           <button
             v-if="itemCtxTeams.length === 2"
-            class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+            class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+            :disabled="itemCtxSharedEquipped"
             @click="ctxEquipTeams(['CT', 'T'])"
           >
-            <Copy class="h-3.5 w-3.5" /> Equip on both teams
+            <Copy class="h-3.5 w-3.5" /> {{ itemCtxSharedEquipped ? 'Equipped on both teams' : 'Equip on both teams' }}
           </button>
         </template>
-        <button class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxView3d">
-          <Box class="h-3.5 w-3.5" /> View in 3D
-        </button>
         <button
           v-if="itemCtx && !['agent', 'graffiti', 'musickit'].includes(itemCtx.inst.slot ?? '')"
           class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"

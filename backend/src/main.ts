@@ -8,7 +8,7 @@ import Fastify, { LogController } from "fastify";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
-import { getStickerMarkup, getCharmModels } from "./stickerMarkup.ts";
+import { getStickerMarkup, getCharmModels, getCharmShading } from "./stickerMarkup.ts";
 import {
   getWeapons,
   getDefaults,
@@ -69,6 +69,11 @@ app.get("/api/catalog", async () => {
     defaults: getDefaults(),
     assetVersion: await assetVersion(),
     assetOrigin: await assetOrigin(),
+    // The client builds card URLs itself, so it needs the same version the
+    // upload path keys them on — see renderKeyForRow. It rides here for the
+    // same reason assetVersion does: this is the one call that always lands
+    // before anything asks for a card.
+    renderVersion: await renderVersion(),
   };
 });
 
@@ -83,30 +88,66 @@ const RENDERS_DIR = process.env.RENDERS_DIR ?? "/cs2-models/renders";
 app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_req, body, done) => done(null, body));
 // Key is derived SERVER-SIDE from the caller's own instance row — a client
 // can never write another user's render slot (or an arbitrary path).
-export function renderKeyForRow(row: { id: number | string; wear: number | string | null; seed: number | string | null; stattrak: boolean | null }) {
-  // Version suffix = render pipeline version: bumping it makes every older
-  // bake miss so cards re-render instead of serving stale art. Must match
-  // renderKeyFor in src/api.ts. (v2 compositor/legacy-body, v3 content-crop,
-  // v4 paint+lighting: durability inversion, cavity from ao4.b, the disabled
-  // g_bUseOverlay/g_bUseRoughness gates, and the IBL/key/rim scale-down that
-  // stopped a white specular term swamping every skin's chroma. v5 crop aspect
-  // cap: slim crops (the Nova) went full-bleed in cards and drew oversized.
-  // v6 noPaint/composite-inputs: dropped the base-metalness gate on noPaint
-  // that was painting polymer hardware, and started picking the HD vs legacy
-  // composite-input bundle to match the body being rendered.
-  // v7 StatTrak module: cards now draw the module, so the ST flag has to be in
-  // the key or toggling it serves the pre-toggle bake.)
+export function renderKeyForRow(
+  row: { id: number | string; wear: number | string | null; seed: number | string | null; stattrak: boolean | null },
+  version: number,
+) {
+  // The version suffix is the EXTRACTION PIPELINE version — EXTRACT_VERSION in
+  // scripts/extract-models.sh, as stamped into extract-version.json by the last
+  // successful run. It used to be a hand-written "-v7" that lived only here, and
+  // the history of that is the argument against it: v2 compositor/legacy-body,
+  // v3 content-crop, v4 paint+lighting, v5 crop aspect cap, v6 noPaint /
+  // composite-input bundle, v7 StatTrak module — seven bumps, each remembered by
+  // hand, each one a chance to forget and serve stale art forever.
   //
-  // The key covers id+wear+seed+stattrak only — NOT the shader — so a
-  // compositor fix changes the pixels while the filename stays put, and every
-  // card keeps serving the pre-fix bake. Bumping this is the ONLY thing that
-  // invalidates them; "clear cache" cannot, because the URL is unchanged.
+  // Riding the extraction version instead means a re-extract invalidates every
+  // card by itself, which is the same self-invalidating property the composite
+  // store gets from hashing its shader (see COMPOSITES_DIR). New textures on the
+  // mount genuinely do change what a card should look like, so "re-extracted"
+  // and "re-bake" are the same event. Superseded files are swept by
+  // pruneRenders() rather than left to rot.
   //
-  // Deliberately NOT the kill count: the 2D module renders a blank display, so
-  // the card is identical at 0 kills and 4000. Putting the count here would
-  // re-bake every card on every kill.
+  // A render-pipeline change with no extraction behind it still needs a manual
+  // nudge — bump EXTRACT_VERSION, which is one number for both.
+  //
+  // The rest of the key covers id+wear+seed+stattrak. Deliberately NOT the kill
+  // count: the 2D module renders a blank display, so the card is identical at 0
+  // kills and 4000, and keying on the count would re-bake every card on every
+  // kill. Must match renderKeyFor in src/api.ts.
   const st = row.stattrak ? "-st" : "";
-  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}-v7.png`;
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}-v${version}.png`;
+}
+
+/** The version cards are keyed on right now: what the mount says it is, or 0
+ *  for a mount nothing has ever been extracted onto. Read per call — this runs
+ *  on card upload and after an extraction, neither of them hot. */
+async function renderVersion(): Promise<number> {
+  return (await readExtractVersion()) ?? 0;
+}
+
+/**
+ * Delete card bakes that are not of the current version.
+ *
+ * The counterpart to the version suffix above: without this, every extraction
+ * would leave a full generation of superseded PNGs behind and the mount would
+ * grow without bound. Renders are cheap to rebuild (the client re-bakes on the
+ * first miss), so unlike the composite store there is nothing to be gained by
+ * ageing them out by LRU — anything that isn't current is already unreachable.
+ */
+async function pruneRenders(): Promise<number> {
+  const current = await renderVersion();
+  // An unstamped mount means the version is unknown, not zero-and-everything-
+  // is-stale. Deleting the whole cache on that reading would be the worst
+  // possible response to a read failure.
+  if (!current) return 0;
+  const suffix = `-v${current}.png`;
+  let removed = 0;
+  for (const name of await fs.readdir(RENDERS_DIR).catch(() => [])) {
+    if (!name.startsWith("inst-") || !name.endsWith(".png") || name.endsWith(suffix)) continue;
+    await fs.rm(path.join(RENDERS_DIR, name), { force: true }).catch(() => {});
+    removed++;
+  }
+  return removed;
 }
 // The size check below allows 3MB, but Fastify's 1MB default would have
 // rejected anything over 1MB before the handler saw it — so that ceiling was
@@ -132,7 +173,7 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
   }
   try {
     await fs.mkdir(RENDERS_DIR, { recursive: true });
-    await fs.writeFile(path.join(RENDERS_DIR, renderKeyForRow(rows[0])), body);
+    await fs.writeFile(path.join(RENDERS_DIR, renderKeyForRow(rows[0], await renderVersion())), body);
     return { ok: true };
   } catch {
     return reply.status(500).send({ error: "render store unavailable" });
@@ -700,7 +741,10 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/charm-model", async (
   // cs2-lib names assets `<game stem>_<hash8>.webp`; the stem is the econ name.
   const stem = path.basename(image).replace(/\.webp$/i, "").replace(/_[0-9a-f]{8}$/i, "");
   const charm = (await getCharmModels())[stem] ?? null;
-  return { charm };
+  // The whole shading map rides along rather than the entry for this charm: the
+  // caller matches it against the material names inside the GLB, which only it
+  // can see, and the map is the handful of materials that deviate from identity.
+  return { charm, shading: charm ? await getCharmShading() : {} };
 });
 
 app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", async (request) => {
@@ -846,7 +890,11 @@ interface ItemRow {
   nametag: string | null;
   stickers?: unknown[] | null;
   charm_id?: number | null;
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+  /** Placement plus the charm's own PATTERN. `seed` rides in the same jsonb as
+   *  x/y/z rather than taking a column of its own: it is per-attached-charm,
+   *  arrives and leaves with the charm, and the game's keychain message carries
+   *  it in the same breath as the offsets. */
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
   patches?: unknown[] | null;
 }
 
@@ -1061,7 +1109,9 @@ function inspectLinkFor(
     stickers?: unknown[] | null;
     patches?: unknown[] | null;
     charm_id?: number | null;
-    charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+    // seed included, or "Inspect in game" on an UNSAVED craft would drop the
+    // charm pattern the user just set and show 0.
+    charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
   },
 ): string | null {
   const item = getItem(itemId);
@@ -1093,7 +1143,7 @@ function inspectLinkFor(
       offsetX: row.charm_offset?.x ?? null,
       offsetY: row.charm_offset?.y ?? null,
       offsetZ: row.charm_offset?.z ?? null,
-      pattern: 0,
+      pattern: row.charm_offset?.seed ?? 0,
     });
   }
 
@@ -2008,7 +2058,6 @@ async function syncGameConfigs(url: string, key: string): Promise<{ updated: str
         .replace(/\s+$/, "");
       const next = invsimBlock(url, key) + "\n" + cleaned + "\n";
       if (next === rows[0]?.cfg) {
-        app.log.info(`[invsim-cfg] ${type}: already up to date`);
         continue;
       }
       await pool.query(
@@ -2023,7 +2072,6 @@ async function syncGameConfigs(url: string, key: string): Promise<{ updated: str
       failed.push(type);
     }
   }
-  app.log.info(`[invsim-cfg] sync done — updated: [${updated.join(", ")}] failed: [${failed.join(", ")}]`);
   return { updated, failed };
 }
 
@@ -2703,6 +2751,12 @@ async function startExtraction(): Promise<{ started: true } | { code: number; er
       for (const dir of ["raw", "raw_ci"]) {
         await fs.rm(path.join(work, dir), { recursive: true, force: true }).catch(() => {});
       }
+      // Card bakes are keyed on the extraction version (see renderKeyForRow), so
+      // a run that bumped it has just orphaned the whole previous generation.
+      // Only after `ok`: a failed run leaves the stamp alone, and sweeping on the
+      // strength of a half-written mount would delete cards nothing replaces.
+      const swept = await pruneRenders();
+      if (swept) app.log.info(`[extract-models] pruned ${swept} superseded card render(s)`);
     }
     await writeExtractState({
       state: ok ? "succeeded" : "failed",
@@ -2932,7 +2986,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     stickers: unknown[] | null;
     patches: unknown[] | null;
     charm_id: number | null;
-    charm_offset: { x?: number; y?: number; z?: number } | null;
+    charm_offset: { x?: number; y?: number; z?: number; seed?: number } | null;
   }>(
     `SELECT l.team, l.slot, i.id AS uid, i.item_id, i.wear, i.seed, i.stattrak,
             i.stattrak_count, i.nametag, i.stickers, i.patches, i.charm_id, i.charm_offset
@@ -3003,7 +3057,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
       const charmKit = row.charm_id != null ? getItem(row.charm_id)?.index : null;
       if (charmKit != null) {
         const keychain: { def: number; seed: number; slot: number; x?: number; y?: number; z?: number } = {
-          def: charmKit as number, seed: 0, slot: 0,
+          def: charmKit as number, seed: row.charm_offset?.seed ?? 0, slot: 0,
         };
         if (row.charm_offset?.x != null) keychain.x = row.charm_offset.x;
         if (row.charm_offset?.y != null) keychain.y = row.charm_offset.y;

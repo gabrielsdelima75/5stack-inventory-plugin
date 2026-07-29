@@ -151,8 +151,57 @@ export interface CharmModel {
   material?: string;
 }
 
+/**
+ * How the game shades a charm material, keyed by material stem.
+ *
+ * The decompiled GLB holds the raw texture channels; csgo_weapon.vfx rewrites
+ * them per material before use, and rendering the raw values is visibly wrong —
+ * Sasquatch's eyes are authored metalness 1 against a declared remap range of
+ * [0, 0.5], so they came out as chrome mirrors instead of dull white.
+ *
+ * Keyed by MATERIAL, not by charm: the clasp is one material shared across a
+ * collection, and charm-keyed params would put one charm's tuning on every
+ * chain. Only materials that need a correction appear — see the charm-models
+ * step in extract-models.sh.
+ */
+export interface CharmShading {
+  /** Scale for the metalness channel — `g_vMetalnessRemapRange`'s upper bound. */
+  metalness?: number;
+  /** Affine adjust on roughness: `roughness * scale + offset`, from
+   *  `g_fTextureRoughnessBrightness` / `Contrast`. */
+  roughness?: number;
+  roughnessOffset?: number;
+}
+
 const CHARM_FILE = path.join(MODELS_DIR, "charm-models.json");
+const SHADING_FILE = path.join(MODELS_DIR, "charm-shading.json");
 let charmCache: { mtimeMs: number; map: Record<string, CharmModel> } | null = null;
+let shadingCache: { mtimeMs: number; map: Record<string, CharmShading> } | null = null;
+
+/** Per-material charm shading, or {} on a mount that predates v16. */
+export async function getCharmShading(): Promise<Record<string, CharmShading>> {
+  try {
+    const { mtimeMs } = await stat(SHADING_FILE);
+    if (shadingCache && shadingCache.mtimeMs === mtimeMs) return shadingCache.map;
+    const doc = JSON.parse(await readFile(SHADING_FILE, "utf8")) as Record<string, unknown>;
+    const map: Record<string, CharmShading> = {};
+    for (const [stem, raw] of Object.entries(doc)) {
+      const e = raw as Record<string, unknown>;
+      const out: CharmShading = {};
+      // A NaN here would reach three as a material property and render the charm
+      // black, which is far harder to trace back than a dropped correction.
+      for (const key of ["metalness", "roughness", "roughnessOffset"] as const) {
+        const v = Number(e[key]);
+        if (Number.isFinite(v)) out[key] = v;
+      }
+      if (Object.keys(out).length) map[stem] = out;
+    }
+    shadingCache = { mtimeMs, map };
+    return map;
+  } catch {
+    return {};
+  }
+}
 
 /** Charm model map, or {} when the mount predates the charm-models step. */
 export async function getCharmModels(): Promise<Record<string, CharmModel>> {

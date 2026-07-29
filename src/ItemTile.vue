@@ -37,8 +37,15 @@ const props = withDefaults(
     showHeader?: boolean;
     /** Hide per-item actions (bulk-select mode, read-only viewer). */
     hideActions?: boolean;
+    /**
+     * Horizontal list row instead of a card. Compact only: a 168px art well
+     * with 78px of chrome under it is ~246px tall, which is more than a phone's
+     * picker sheet has to give — you got two clipped cards and no sign that a
+     * third existed. A 68px row shows six, and the name stops truncating.
+     */
+    row?: boolean;
   }>(),
-  { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false },
+  { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false, row: false },
 );
 
 const emit = defineEmits<{
@@ -106,13 +113,16 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
   <button
     data-role="item-tile"
     :data-origin="inst.origin ?? 'crafted'"
-    class="group relative flex h-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-muted-foreground/40 disabled:opacity-50"
+    class="group relative flex overflow-hidden rounded-lg border border-border bg-card text-left transition-colors hover:border-muted-foreground/40 disabled:opacity-50"
     :class="[
+      row ? 'w-full items-center gap-3 px-2.5 py-2' : 'h-full flex-col px-2.5 py-2.5',
       active && !selected ? 'outline outline-2 -outline-offset-2 outline-[color:var(--acc)]' : '',
       selected ? 'outline outline-2 -outline-offset-2 outline-[hsl(var(--tac-amber,33_94%_58%))]' : '',
     ]"
     :style="{
-      ...(inst.item?.rarity ? { borderBottom: `3px solid ${inst.item.rarity}` } : {}),
+      // The rarity edge moves to the left in row mode: a bottom rule between
+      // stacked rows reads as a divider, not as the item's own rarity.
+      ...(inst.item?.rarity ? (row ? { borderLeft: `3px solid ${inst.item.rarity}` } : { borderBottom: `3px solid ${inst.item.rarity}` }) : {}),
       ...(selected ? { background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.08)' } : {}),
     }"
     :disabled="disabled"
@@ -140,9 +150,11 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       {{ baking ? 'baking' : preparing ? 'preparing' : 'queued' }}
     </span>
 
-    <!-- Hover actions. Shared with the loadout rail's equipment tiles. -->
+    <!-- Hover actions. Shared with the loadout rail's equipment tiles.
+         Never in row mode: rows exist for compact, where a tap already opens
+         the action menu that holds every one of these. -->
     <TileActions
-      v-if="!hideActions"
+      v-if="!hideActions && !row"
       :inst="inst"
       @view3d="emit('view3d')"
       @inspect="emit('inspect')"
@@ -151,6 +163,41 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       @remove="emit('remove')"
     />
 
+    <!-- ============ ROW ============ -->
+    <!-- Same information, one line: thumb · (model) name + wear · state dots. -->
+    <template v-if="row">
+      <div class="relative z-[2] grid h-11 w-14 flex-none place-items-center rounded bg-background/40">
+        <ItemArt :inst="inst" :image="inst.item?.image" class="max-h-full max-w-full object-contain" />
+      </div>
+      <div class="relative z-[2] min-w-0 flex-1">
+        <div v-if="showHeader" class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
+          {{ weaponName(inst.item) || inst.slot }}
+        </div>
+        <div class="flex items-center gap-1.5">
+          <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
+          <span v-if="inst.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
+          <span v-if="attachments.length" class="flex flex-none items-center gap-0.5">
+            <img v-for="(a, k) in attachments.slice(0, 4)" :key="k" :src="a.image ?? undefined" :title="a.name" alt="" class="h-3.5 w-3.5 object-contain" />
+          </span>
+        </div>
+        <!-- Inline, not stacked: the stacked variant spends a second line on
+             the float/seed readout, which is the difference between a row that
+             fits the budget below and one that doesn't. -->
+        <WearBar :wear="inst.wear" :seed="inst.seed" inline compact class="mt-1" />
+      </div>
+      <span class="relative z-[2] flex flex-none items-center gap-1.5">
+        <TeamDots :teams="equippedTeams" />
+        <RefreshCw
+          v-if="readOnly"
+          class="h-3 w-3 flex-none"
+          :style="{ color: STEAM_BLUE }"
+          title="Synced from your Steam inventory (read-only)"
+        />
+      </span>
+    </template>
+
+    <!-- ============ CARD ============ -->
+    <template v-else>
     <!-- Model + status dots: steam-synced (steam blue), equipped per team
          (CT blue / T amber) — hover any dot for the label. -->
     <div v-if="showHeader" class="relative z-[2] flex items-center justify-between gap-2">
@@ -190,5 +237,6 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
     </div>
 
     <WearBar :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
+    </template>
   </button>
 </template>

@@ -132,11 +132,20 @@ export function composeDigitAtlas(
 // be a cast that proves nothing. Length is checked where it's consumed.
 export interface StatTrakAnchor {
   /**
-   * Raw attachment origin in MODEL INCHES, unswizzled — the space poseXform
-   * consumes. This is the one to use whenever the body has a skeleton, which
-   * is every weapon: the body's vertices were baked through the
+   * The attachment in BIND MODEL space: its `relative_origin` plus the absolute
+   * position of the bone it hangs off, in MODEL INCHES, unswizzled — the space
+   * poseXform consumes. This is the one to use whenever the body has a
+   * skeleton, which is every weapon: the body's vertices were baked through the
    * `inventory_icon` pose, and an anchor that skips that pose stays where the
    * gun USED to be (it renders hanging in space below the weapon).
+   *
+   * The bone term is not decoration. On a gun the parent is `weapon_offset`,
+   * which sits at [0,0,0] under `weapon`, so what gets added is `weapon`'s own
+   * origin (the AK's [2.97, -0.19, 2.98]) — and the pose transform is the
+   * inverse of the same bind, so the two only cancel if both are present.
+   * Validated across all 35 gun .vmdls, and separately on the elite by pushing
+   * its `muzzle_flash` through the same math: it lands at y=0.179 against a
+   * right-pistol silhouette topping out at 0.181, i.e. on the muzzle.
    */
   src: number[];
   /** GLB metres, already swizzled out of Source space by the extractor. Only
@@ -187,6 +196,20 @@ export interface StatTrakAnchorSet {
   /** Knives take the knife module — a bare engraved plate with no housing and
    *  no glow — so this decides both the GLB and whether to light the digits. */
   knife: boolean;
+  /**
+   * The bone the attachment is parented to, when it is NOT the one carrying the
+   * weapon body. A property of the RIG, so it sits beside `knife` rather than
+   * on either variant — hd and legacy hang off the same bone.
+   *
+   * Absent on all 35 guns: they park every attachment on `weapon_offset`, which
+   * is also what the body is weighted to, so the body's own bind→posed
+   * transform places the module. The Dual Berettas are the exception — their
+   * `stattrak` hangs off `weapon_r` while the body weight count is won by
+   * `weapon_l` — and the icon clip moves the two pistols to completely
+   * different places, so naming the bone is the difference between a module on
+   * the gun and one floating half a metre away beside it.
+   */
+  bone?: string;
 }
 
 /** Pick the anchor variant matching the body the viewer actually rendered. */
@@ -194,12 +217,12 @@ export function pickAnchor(
   anchors: Record<string, StatTrakAnchorSet | undefined>,
   model: string,
   legacy: boolean,
-): { anchor: StatTrakAnchor; knife: boolean } | null {
+): { anchor: StatTrakAnchor; knife: boolean; bone?: string } | null {
   const entry = anchors[model];
   if (!entry) return null;
   // Fall back across variants rather than dropping the module: a missing
   // legacy anchor (the Zeus has none) is better served by the HD one a few
   // hundredths of an inch away than by no module at all.
   const anchor = (legacy ? entry.legacy ?? entry.hd : entry.hd ?? entry.legacy) ?? null;
-  return anchor ? { anchor, knife: entry.knife } : null;
+  return anchor ? { anchor, knife: entry.knife, bone: entry.bone } : null;
 }

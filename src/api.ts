@@ -66,6 +66,8 @@ export interface Catalog {
   defaults?: DefaultsMap;
   /** Changes whenever the extracted assets might have. See assetVersion below. */
   assetVersion?: string;
+  /** Extraction pipeline version the card bakes are keyed on. See renderKeyFor. */
+  renderVersion?: number;
   /** Where to fetch item art and paint assets from. Empty (the default) means
    *  the same host that served this API. Non-empty when the operator has opted
    *  into the shared 5stack CDN. */
@@ -125,7 +127,7 @@ export interface InventoryItem {
   nametag: string | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
-  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null }) | null;
+  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null }) | null;
   slot: string | null;
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];
@@ -204,6 +206,7 @@ export const withAssetVersion = (url: string) =>
 export const fetchCatalog = async () => {
   const c = await request<Catalog>("/catalog");
   if (c.assetVersion) assetVersion = c.assetVersion;
+  if (typeof c.renderVersion === "number") renderVersion = c.renderVersion;
   // Empty string is meaningful — "serve from this host" — so only a non-empty
   // value overrides the default.
   if (c.assetOrigin) assetOrigin = c.assetOrigin;
@@ -212,15 +215,29 @@ export const fetchCatalog = async () => {
 
 // Cached true-render card images (client 3D snapshots stored on the mount).
 // Number() guards: pg numerics can arrive as strings — .toFixed on a string throws.
-// Version suffix must match the backend's key builder — bumped when the
-// render pipeline changes so stale bakes miss and re-render.
+//
+// The version suffix is the EXTRACTION pipeline version, handed over by the
+// catalog. It replaced a hand-bumped constant that lived in two files and had
+// to be remembered in both; keying on the extraction means a re-extract
+// re-bakes every card by itself, which is right — new textures on the mount are
+// exactly the thing that changes what a card should look like. Must match
+// renderKeyForRow in backend/src/main.ts, and the backend sweeps the superseded
+// generation once an extraction finishes.
+//
+// Safe to read at call time: every caller reaches a card through the inventory,
+// which App.vue only sets after fetchCatalog has resolved alongside it. The 0
+// fallback is therefore an unstamped mount, not a race — and it is consistent
+// with what the backend derives from the same missing stamp, so the two still
+// agree on the filename.
+//
 // The ST flag is in the key (cards draw the module) but the kill count is NOT
 // — the 2D module renders a blank display, so a card is identical at 0 kills
 // and 4000. Keying on the count would re-bake every card on every kill.
 // stattrak is REQUIRED, not optional: an omitted flag silently builds a key
 // that disagrees with the one the writer used, and the card 404s forever.
+let renderVersion = 0;
 export const renderKeyFor = (i: { id: number; wear: number | null; seed: number | null; stattrak: boolean | null }) =>
-  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}${i.stattrak ? "-st" : ""}-v7.png`;
+  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}${i.stattrak ? "-st" : ""}-v${renderVersion}.png`;
 // Served via /api (canonical): that ingress path provably reaches the backend
 // pod that stores the files — immune to stale nginx images, CDN-cached 404s,
 // and hostPath node mismatches. Plain <img> tags send session cookies, so the
@@ -479,7 +496,7 @@ export const craftItem = (body: {
   stickers?: AttachSpec[];
   patches?: AttachSpec[];
   charm_id?: number | null;
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
 }) =>
   request<InventoryItem>("/inventory/craft", {
     method: "POST",
@@ -496,7 +513,7 @@ export const updateInstance = (
     stickers?: AttachSpec[];
     patches?: AttachSpec[];
     charm_id?: number | null;
-    charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+    charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
   },
 ) =>
   request<InventoryItem>(`/inventory/${id}`, {
@@ -680,7 +697,7 @@ export const fetchDraftInspectLink = (body: {
   stickers?: AttachSpec[];
   patches?: AttachSpec[];
   charm_id?: number | null;
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
 }) =>
   request<{ inspect: string }>("/inspect/preview", {
     method: "POST",

@@ -810,12 +810,106 @@ interface PosedModel {
   hiddenBones: number;
   poseXform: import("three").Matrix4 | null;
 }
+
+/**
+ * What bakePose hands back for ATTACHMENTS, as opposed to for the body.
+ *
+ * `poseXform` answers "where did the BODY go", which is the only question a
+ * single-weapon rig can ask — every attachment on all 35 guns hangs off
+ * `weapon_offset`, the same bone the body is weighted to. The Dual Berettas
+ * break that: `weapon_r` and `weapon_l` move independently under the icon clip
+ * (measured: the right pistol tilts 65 degrees, the left 179), and the stattrak
+ * attachment is parented to `weapon_r` specifically. Placing it with the body's
+ * transform — which is whichever pistol won the weight count, i.e. the LEFT one
+ * — throws the module half a metre out into space beside the gun.
+ */
+interface PoseBones {
+  /** bind→posed for every bone, by name. Model INCHES -> world METRES, like
+   *  poseXform: the bone's live matrixWorld carries the glb node transform
+   *  while its bind inverse does not. */
+  byName: Map<string, import("three").Matrix4>;
+  /** Rotation of the exporter's model→world node matrix (the axis swizzle).
+   *  Dividing it out of a bone's pose leaves the rotation the CLIP applied,
+   *  which is what an attachment has to share. It measures 0.05-0.09 degrees
+   *  (i.e. nothing) on every gun and 65 degrees on the elite's `weapon_r`. */
+  modelQuat: import("three").Quaternion | null;
+}
 const posedCache = new Map<string, PosedModel>();
 // Matches GLTF_CACHE_MAX — there is no point holding posed geometry for a model
 // whose source has already been evicted. ~1MB an entry.
 const POSED_CACHE_MAX = 12;
 
-function bakePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"], cacheKey: string) {
+/**
+ * The rotation the CLIP applied to one bone, with the exporter's model→world
+ * swizzle divided out.
+ *
+ * The swizzle has to go because it is already baked into everything else we
+ * hang on the model — the StatTrak module's own glb node applies the identical
+ * transform, so keeping it here applies the axis swap twice and stands the
+ * module on end. What is left is the display motion, and it is the display
+ * motion alone that an attachment (or the whole model) has to share.
+ *
+ * Measures 0.05-0.09 degrees on every single-weapon rig (ak47, m4a1, revolver,
+ * xm1014, mag7, negev) — the icon pose is a pure translation there, so this is
+ * identity for guns. On the elite it is 65 degrees for `weapon_r` and 179 for
+ * `weapon_l`: that difference IS the tent.
+ */
+function clipRotation(
+  THREE: ThreeBundle["THREE"],
+  pose: import("three").Matrix4 | null | undefined,
+  modelQuat: import("three").Quaternion | null,
+): import("three").Quaternion | null {
+  if (!pose || !modelQuat) return null;
+  const q = new THREE.Quaternion();
+  pose.decompose(new THREE.Vector3(), q, new THREE.Vector3());
+  return q.multiply(modelQuat.clone().invert());
+}
+
+/**
+ * How far the second pistol of a dual-wield pair sits from the first, in the
+ * FIRST one's own Source axes (x = forward/muzzle, y = left, z = up) and in
+ * MODEL INCHES — so it is a fraction of the weapon rather than a length in
+ * metres, and survives a re-extract that rescales nothing.
+ *
+ * Measured off CS2's own inspect screen rather than guessed. Taking the pair as
+ * roughly coplanar and square to that camera, the second pistol sits 0.56 of a
+ * gun length back along the barrel and 0.47 up from it — so on a ~8.5in Beretta,
+ * 4.8in and 4.0in. The sideways step is about one gun thickness: enough that the
+ * two read as stacked in depth instead of intersecting, without opening a gap.
+ */
+const DUAL_OFFSET_INCHES = { forward: -4.8, left: -1.4, up: 4.0 };
+/** Bone-name suffixes that make a dual-wield rig: `weapon_r` / `weapon_l` and
+ *  their per-part twins (slide_l/slide_r, magazine_l/magazine_r, ...). */
+const DUAL_LEFT_SUFFIX = /_l$/;
+
+function bakePose(
+  root: import("three").Object3D,
+  THREE: ThreeBundle["THREE"],
+  cacheKey: string,
+  /**
+   * Lay a dual-wield rig's two weapons out PARALLEL instead of in the pose the
+   * icon clip ships. Ignored by every single-weapon rig, which has no `*_l`
+   * bones to move.
+   *
+   * CS2's `inventory_icon` builds a TENT — two pistols leaning together,
+   * barrels up. That is right for the 2D card, because it IS the game's own
+   * item art; it reads as a jumble in a viewer you can spin. The inspect screen
+   * shows them the other way: parallel, one offset behind and above the other.
+   *
+   * No shipped clip does that. Measured across all six on the elite, the L-vs-R
+   * angle is 178.5 degrees in icon/inspect/dropped and 12.6 in shoot/reload
+   * (which also hold them 19cm apart, where the hands are). So it is
+   * synthesised: give every `*_l` bone its `*_r` twin's POSED transform plus one
+   * offset, and the left pistol becomes a copy of the right one, displaced.
+   *
+   * That is exact, not an approximation. The skin sandwich
+   * (bone.matrixWorld * boneInverse) undoes the LEFT bind before applying the
+   * RIGHT pose, so the left pistol's vertices land on the right pistol's
+   * silhouette even though the two bind poses are 20 inches apart
+   * (weapon_hand_l's origin is [0, 20, 0.2]).
+   */
+  sideBySide = false,
+) {
   const hit = posedCache.get(cacheKey);
   const geoms = hit?.geoms ?? new Map<string, import("three").BufferGeometry>();
   let droppedTris = hit?.droppedTris ?? 0;
@@ -826,6 +920,64 @@ function bakePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"], c
   root.traverse((n) => {
     if ((n as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) skinned.push(n as import("three").SkinnedMesh);
   });
+  // Parallel layout, BEFORE anything reads a bone: the per-vertex blend below
+  // and the per-bone snapshot after it must both see the same skeleton, or the
+  // StatTrak module would be placed against a pose the geometry never took.
+  // See the `sideBySide` parameter for why this is synthesised.
+  if (sideBySide && skinned[0]) {
+    const boneList = skinned[0].skeleton.bones;
+    const byName = new Map(boneList.map((b) => [b.name, b]));
+    const right = byName.get("weapon_r");
+    if (right) {
+      // The offset is authored in the right pistol's own axes, so rotate it by
+      // that bone and scale it by the model's inch->metre factor, which the
+      // bone's world matrix already carries.
+      const rq = new THREE.Quaternion();
+      const rs = new THREE.Vector3();
+      right.matrixWorld.decompose(new THREE.Vector3(), rq, rs);
+      const { forward, left, up } = DUAL_OFFSET_INCHES;
+      const shift = new THREE.Matrix4().setPosition(
+        new THREE.Vector3(forward, left, up).applyQuaternion(rq).multiplyScalar(rs.x),
+      );
+      for (const bone of boneList) {
+        if (!DUAL_LEFT_SUFFIX.test(bone.name)) continue;
+        const twin = byName.get(bone.name.replace(DUAL_LEFT_SUFFIX, "_r"));
+        // No twin means it isn't half of a mirrored pair — leave it posed as the
+        // clip left it rather than guessing.
+        if (twin) bone.matrixWorld.multiplyMatrices(shift, twin.matrixWorld);
+      }
+    }
+  }
+  // Per-bone transforms, for attachments — see PoseBones. Read from the first
+  // skinned mesh and NOT cached: it is 16 matrix multiplies on the largest rig,
+  // against the per-vertex blend below that the cache actually exists for.
+  const bones: PoseBones = { byName: new Map(), modelQuat: null };
+  {
+    const sm = skinned[0];
+    if (sm) {
+      sm.skeleton.bones.forEach((bone, bi) => {
+        if (bones.byName.has(bone.name)) return;
+        bones.byName.set(
+          bone.name,
+          new THREE.Matrix4()
+            .multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[bi])
+            .multiply(sm.bindMatrix)
+            .premultiply(sm.bindMatrixInverse),
+        );
+      });
+      // Walk out of the bone chain to the node the exporter parked the swizzle
+      // (and the inch->metre scale) on. decompose, not setFromRotationMatrix:
+      // that scale is in the upper 3x3 and would be read as part of the
+      // rotation.
+      let top: import("three").Object3D = sm.skeleton.bones[0];
+      while (top?.parent && (top.parent as unknown as { isBone?: boolean }).isBone) top = top.parent;
+      if (top?.parent) {
+        const q = new THREE.Quaternion();
+        top.parent.matrixWorld.decompose(new THREE.Vector3(), q, new THREE.Vector3());
+        bones.modelQuat = q;
+      }
+    }
+  }
   const scale = new THREE.Vector3();
   const pos3 = new THREE.Vector3();
   const quat = new THREE.Quaternion();
@@ -973,7 +1125,7 @@ function bakePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"], c
       if (oldest) posedCache.delete(oldest);
     }
   }
-  return { droppedTris, hiddenBones, poseXform };
+  return { droppedTris, hiddenBones, poseXform, bones };
 }
 
 // ---- Sticker / charm placement ------------------------------------------------
@@ -1090,16 +1242,49 @@ let idleWaiters: (() => void)[] = [];
  *  otherwise compete with a viewer for the GPU, and show it as queued rather
  *  than pretending it is already underway. */
 export const viewersIdle = () =>
-  liveViewers === 0
+  liveViewers === 0 && !idleTimer
     ? Promise.resolve()
     : new Promise<void>((resolve) => {
         idleWaiters.push(resolve);
       });
-function releaseViewer() {
-  if (--liveViewers > 0) return;
+
+const COARSE_POINTER = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
+/**
+ * How long a phone must stay viewer-free before bakes are allowed back.
+ *
+ * "Idle" used to mean the instant the last viewer released, which is true but
+ * useless when the user is doing what users do: open an item, close it, open
+ * the next. Every gap between two modals released the whole parked backlog, a
+ * bake began allocating its render targets and uploading its inputs, and the
+ * next modal preempted it a moment later. Nothing completed and the allocations
+ * stacked up faster than the GC reclaimed them — which is the reload.
+ *
+ * A settle window turns that into one decision: if you are still browsing, no
+ * bake ever starts.
+ */
+const IDLE_SETTLE_MS = 800;
+let idleTimer: ReturnType<typeof setTimeout> | undefined;
+function flushIdleWaiters() {
+  idleTimer = undefined;
   const waiters = idleWaiters;
   idleWaiters = [];
   for (const w of waiters) w();
+}
+function releaseViewer() {
+  if (--liveViewers > 0) return;
+  if (!COARSE_POINTER) return flushIdleWaiters();
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    // A viewer that came back during the window restarts the wait — acquire
+    // clears the timer, so reaching here means we really are idle.
+    if (liveViewers > 0) return;
+    // Hand the GPU its memory back before anything else asks for some. The
+    // composite LRU exists to make REOPENING a weapon cheap, which is worth
+    // holding render-target pairs for on a desktop and is not worth an OOM on
+    // a phone — the next mount recomposites from cache-warm inputs anyway.
+    if (sharedGL) dropCompositeCache(sharedGL.renderer);
+    flushIdleWaiters();
+  }, IDLE_SETTLE_MS);
 }
 /**
  * TEMPORARY (mdebug): how many GL contexts are actually live, and how many
@@ -1111,6 +1296,8 @@ export const viewerStats = () => ({
   building: buildsInFlight,
   queued: pendingBuilds.length,
   lane: activeBuild?.priority ?? null,
+  /** Viewer-free but inside the settle window — bakes are still held. */
+  settling: !!idleTimer,
 });
 
 export function snapshotModel(
@@ -1181,7 +1368,17 @@ async function snapshotModelNow(
 ): Promise<Blob | null | typeof PREEMPTED | typeof INCOMPLETE> {
   snapshotsInFlight++;
   const holder = document.createElement("div");
-  holder.style.cssText = "position:fixed;left:-10000px;top:0;width:640px;height:480px;pointer-events:none;";
+  // 4:3, deliberately — `fit` solves the camera distance against the frame's
+  // aspect, so changing it would reframe every weapon. Only the RESOLUTION is
+  // ours to pick, and it decides how big a card can draw: the craft modal shows
+  // these at natural size (`max-h-full max-w-full` never upscales), so a small
+  // snapshot is a small picture no matter how much room the modal has.
+  //
+  // Tall subjects are what forced this up. A long gun is limited by the frame's
+  // WIDTH and gets all 960 of it; the Dual Berettas' upright pair is limited by
+  // the height, so at 640x480 it came out ~430px and drew half the size of its
+  // neighbours in the modal.
+  holder.style.cssText = "position:fixed;left:-10000px;top:0;width:960px;height:720px;pointer-events:none;";
   document.body.appendChild(holder);
   let handle: ViewerHandle | null = null;
   try {
@@ -1365,6 +1562,14 @@ async function buildViewer(
   // Bind→posed motion of the weapon body. Null when the model has no skeleton,
   // in which case rendered space already IS model space and nothing to undo.
   let poseXform: import("three").Matrix4 | null = null;
+  // The same motion per BONE, for attachments that hang off something other
+  // than the body — see PoseBones.
+  let poseBones: PoseBones = { byName: new Map(), modelQuat: null };
+  // Lay a dual-wield pair out parallel rather than in the icon's tent. Off for
+  // card bakes (`still`), which want the game's own item art — see the call to
+  // bakePose below. Harmless on a single-weapon rig: bakePose finds no `*_l`
+  // bones to move and the frame correction below finds no `weapon_r`.
+  const dualSideBySide = !opts?.still;
   // The variant decides which of the GLB's textures are worth downloading —
   // the body about to be pruned needs none of its own, and a painted body's
   // base colour is overwritten by the composite. Same two inputs the prune and
@@ -1480,8 +1685,15 @@ async function buildViewer(
     // Box3.setFromObject needs no help.
     // Keyed on the model alone — see PosedModel. The posed geometry it returns
     // is SHARED and must never be disposed by a viewer.
-    const flat = bakePose(object, THREE, model);
+    // The 2D card keeps the icon's tent — it IS the game's item art, and the
+    // baked cards sit in a grid where matching CS2 is the whole point. Anything
+    // you can spin gets the parallel layout instead. See bakePose's
+    // `sideBySide`, and note the posed geometry is SHARED, so the layout has to
+    // be part of its cache key or a bake and a viewer would hand each other the
+    // wrong pair.
+    const flat = bakePose(object, THREE, `${model}${dualSideBySide ? "|dual" : ""}`, dualSideBySide);
     poseXform = flat.poseXform;
+    poseBones = flat.bones;
     propStats = `props -${flat.droppedTris}tri / ${flat.hiddenBones} bones`;
   }
   // CS2 exports ship BOTH bodies stacked: the CS:GO-era "_legacy" mesh AND the
@@ -1682,10 +1894,15 @@ async function buildViewer(
   // wasted. Rotating the model instead of special-casing the camera means one
   // presentation rule for everything, and it is a NO-OP for all 35 guns.
   //
-  // Guarded on CHARM_ANCHORS: those anchors (and the sticker placement space
-  // below) are stored in the model's own frame, so rotating a model that has
-  // them would silently move every attachment. Nothing with placement data is
-  // touched — knives carry neither stickers nor charms.
+  // KNIVES ONLY. The gate used to be "absent from CHARM_ANCHORS" as a stand-in
+  // for "is a knife" — those anchors are stored in the model's own frame, so
+  // rotating a model that has them would silently move every attachment. But
+  // the two are not the same set: the Dual Berettas have no charm anchor either
+  // (their dual-wield rig has no `weapon_offset` bone for the extractor to
+  // resolve), so a pair of pistols was being presented as a knife. This rule
+  // reads a bounding box, and a box cannot tell a blade from a tent of two
+  // pistols — it took the tent's HEIGHT for a blade's length and laid the pair
+  // on its side. The pair gets its own presentation below instead.
   // Then roll about that long axis so the BROAD face turns toward the camera.
   // You only see a face by looking along its normal, and the broad face's
   // normal is the thinnest axis. The camera vector normalises to about
@@ -1695,8 +1912,48 @@ async function buildViewer(
   const WORLD_X = new THREE.Vector3(1, 0, 0);
   const WORLD_Y = new THREE.Vector3(0, 1, 0);
   const WORLD_Z = new THREE.Vector3(0, 0, 1);
+
+  // A parallel pair still points wherever the icon clip aimed the pistols,
+  // which is up and tilted back — fine for a tent, wrong for two guns that are
+  // now supposed to read like every other weapon on the shelf. Undo the clip's
+  // rotation and the pair lands in the frame the camera below was tuned
+  // against: measured on the ak47 and m4a1, an unrotated weapon has muzzle +Z,
+  // up +Y, left +X, and undoing the elite's 65 degrees puts it exactly there.
+  //
+  // Deliberately NOT a re-measure of the bounding box like the knife branch
+  // does: a box has no idea which end is the muzzle, and on a pair of pistols
+  // it would have picked the pair's own diagonal.
+  if (dualSideBySide) {
+    const upright = clipRotation(THREE, poseBones.byName.get("weapon_r"), poseBones.modelQuat);
+    if (upright) {
+      object.quaternion.premultiply(upright.invert());
+      object.updateMatrixWorld(true);
+    }
+  }
   let flatOn = false;
-  if (!(model in CHARM_ANCHORS)) {
+  // The CARD's dual-wield pair, still in the icon's tent (the side-by-side
+  // layout is the viewer's). Presented explicitly rather than through the
+  // box-driven knife rule, because we know exactly what this shape is and a
+  // bounding box does not:
+  //
+  //   - Square to the pair's flat face. It IS flat — 0.085m thick against
+  //     0.305 tall — so any oblique angle foreshortens both pistols at once and
+  //     the card reads as a crooked jumble.
+  //   - Muzzles up, which is how CS2 draws its own Dual Berettas icon.
+  //   - From the side the StatTrak module is bolted to. The module hangs off
+  //     the attachment's +Y (Source "left"), which the exporter's swizzle puts
+  //     on +X — so +X has to end up facing the camera, or the readout is on the
+  //     far side of the gun and the card shows its blank back.
+  //
+  // The tent already stands the way we want in the model's own frame: thin on
+  // X, tall on Y with the barrels up. So the whole presentation is one quarter
+  // turn to bring +X round to the camera, and the flat-on camera below.
+  const stillTent = !dualSideBySide && poseBones.byName.has("weapon_l");
+  if (stillTent) {
+    object.rotateOnWorldAxis(WORLD_Y, -Math.PI / 2); // model +X -> world +Z
+    object.updateMatrixWorld(true);
+    flatOn = true;
+  } else if (/^(bayonet|knife)/.test(model)) {
     const pre = new THREE.Box3().setFromObject(object).getSize(new THREE.Vector3());
     const dims = [pre.x, pre.y, pre.z];
     const longest = dims.indexOf(Math.max(...dims));
@@ -1779,8 +2036,11 @@ async function buildViewer(
           dist = Math.max(dist, depth + Math.abs(c.dot(right)) / tanH, depth + Math.abs(c.dot(upv)) / tanV);
         }
     // Guns want a tight crop; a knife tilted to 30 degrees needs slack or it
-    // reads as zoomed-in and clips its own corners against the frame.
-    camera.position.copy(dir.multiplyScalar(dist * (flatOn ? 1.35 : 1.07)));
+    // reads as zoomed-in and clips its own corners against the frame. The
+    // dual-wield tent is flat-on but NOT tilted, so it wants the tight one —
+    // the slack costs it a third of its pixels, and since cropToContent trims
+    // the empty margin away afterwards, all that buys is a blurrier card.
+    camera.position.copy(dir.multiplyScalar(dist * (flatOn && !stillTent ? 1.35 : 1.07)));
   } else {
     const frame = opts?.frame ?? 1;
     camera.position.set(radius * camDir.x * frame, radius * camDir.y * frame, radius * camDir.z * frame);
@@ -1846,17 +2106,38 @@ async function buildViewer(
    * project/unproject — and every sticker hit test built on them — stay exact.
    */
   const panPx = new THREE.Vector2();
+  /** Last pair actually pushed into the projection — see applyPan. */
+  const panApplied = new THREE.Vector2(NaN, NaN);
   const applyPan = () => {
-    // Half a viewport of travel each way. The pivot projects to the centre of
-    // the UNSHIFTED frustum, so this is literally "the weapon's centre may not
-    // leave the frame" — the leash the old target clamp was reaching for.
-    panPx.x = clamp(panPx.x, -cssW * 0.45, cssW * 0.45);
-    panPx.y = clamp(panPx.y, -cssH * 0.45, cssH * 0.45);
+    // The leash is in WORLD units, converted to pixels at the pivot's depth —
+    // NOT a fraction of the viewport. A fixed pixel budget is a shrinking
+    // fraction of the weapon as you zoom in: at full zoom the receiver alone
+    // fills several viewports, so "45% of the screen" would not reach the stock.
+    //
+    // Distance is what changes with zoom, so it is what the limit rides on. Half
+    // the longest edge reaches either tip of the weapon from the centre; 0.6
+    // leaves a little past it. The same number then means "one weapon length of
+    // travel" at every zoom level, and still guarantees some of the gun stays in
+    // frame, which is all the old clamp was really for.
+    const dist = camera.position.distanceTo(controls.target);
+    const worldPerPx = (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / Math.max(1, cssH);
+    const maxPx = (radius * 0.6) / Math.max(worldPerPx, 1e-9);
+    panPx.x = clamp(panPx.x, -maxPx, maxPx);
+    panPx.y = clamp(panPx.y, -maxPx, maxPx);
+    // Cheap enough to call every frame from the zoom re-clamp below, because
+    // rebuilding the projection is skipped whenever nothing actually moved.
+    if (panPx.x === panApplied.x && panPx.y === panApplied.y) return;
+    panApplied.copy(panPx);
     // Negated: setViewOffset picks the sub-window's top-left out of the full
     // image, so shifting the window left is what moves the content right.
     if (panPx.x === 0 && panPx.y === 0) camera.clearViewOffset();
     else camera.setViewOffset(cssW, cssH, -panPx.x, -panPx.y, cssW, cssH);
   };
+  // Zooming OUT shrinks the leash — a pan made at full zoom is a long way in
+  // world units — so re-clamp as the distance changes rather than only while
+  // dragging. Without this, zooming out after a deep pan leaves the weapon
+  // stranded off-frame.
+  controls.addEventListener("change", applyPan);
   /** Pan by a pointer delta in CSS pixels. */
   const panBy = (dx: number, dy: number) => {
     if (!dx && !dy) return;
@@ -1964,7 +2245,9 @@ async function buildViewer(
     if (best[1] < best[0]) return [lo + 0.28 * span, lo + 0.72 * span];
     return [lo + ((best[0] + 0.5) / STEPS) * span, lo + ((best[1] + 0.5) / STEPS) * span];
   }
-  const metrics = metricsFor(model, bodyVariant);
+  // Layout is part of the key: bodySpanL below probes the SILHOUETTE, and a
+  // dual-wield pair has two of them depending on how they are laid out.
+  const metrics = metricsFor(model, `${bodyVariant}${dualSideBySide ? "|dual" : ""}`);
   const [bodyL0, bodyL1] = (metrics.span ??= bodySpanL());
   // 96 full-mesh raycasts, and the answer depends only on (model, bodyVariant).
   mt.mark("span");
@@ -3120,15 +3403,24 @@ async function buildViewer(
    * Until an extraction has pulled them (v13), this answers null and the flat
    * art below stands in — which is what the viewer did for every charm before.
    */
+  /** Per-material shading correction — see tuneCharmShading and the backend's
+   *  charm-shading.json. Absent for every material that needs none. */
+  interface CharmShading {
+    metalness?: number;
+    roughness?: number;
+    roughnessOffset?: number;
+  }
+
   async function loadCharmModel(image: string) {
     // The econ schema decides, not the filename. A community charm is a SHARED
     // blank mesh plus its own material — 23 of the 82 charms on the current
     // build — so guessing the model from the image stem resolved those to
     // nothing and they fell back to flat art. See the charm-models step.
-    const spec = await fetch(`${API_ORIGIN}/api/catalog/charm-model?image=${encodeURIComponent(image)}`)
+    const answer = await fetch(`${API_ORIGIN}/api/catalog/charm-model?image=${encodeURIComponent(image)}`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d: { charm?: { model?: string; material?: string } | null } | null) => d?.charm ?? null)
       .catch(() => null);
+    const spec = (answer as { charm?: { model?: string; material?: string } | null } | null)?.charm ?? null;
+    const shading = (answer as { shading?: Record<string, CharmShading> } | null)?.shading ?? {};
     // Without the map — an older mount, or the backend between restarts — fall
     // back to the item's own name. That is what resolved charms before, and it
     // is right for every charm that owns a model of its own name; losing all of
@@ -3145,10 +3437,58 @@ async function buildViewer(
       // undressed, every community charm is the same grey shape, which is less
       // use than the flat art it would otherwise fall back to.
       if (spec?.material && !(await dressCharm(model, spec.material))) return null;
+      tuneCharmShading(model, shading);
       return model;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Correct the raw texture channels to what csgo_weapon.vfx actually renders.
+   *
+   * The decompiler bakes the metalness/roughness channels straight into the GLB,
+   * and the game does not use them straight: each material declares a metalness
+   * remap range and an affine roughness adjust. Charm | Sasquatch authors its
+   * eyes at metalness 1 while declaring a range of [0, 0.5] — so we rendered
+   * chrome mirrors where the game shows dull white.
+   *
+   * Matched on MATERIAL NAME, which the decompiler sets to the vmat stem. That
+   * matters because the clasp is a separate material shared across a whole
+   * collection: keyed by charm instead, one charm's tuning would land on
+   * everyone's chain.
+   */
+  function tuneCharmShading(model: import("three").Object3D, shading: Record<string, CharmShading>) {
+    if (!shading || !Object.keys(shading).length) return;
+    model.traverse((n) => {
+      const mesh = n as import("three").Mesh;
+      if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
+      const mat = mesh.material as import("three").MeshStandardMaterial;
+      const tune = mat && shading[mat.name];
+      if (!tune) return;
+      // Idempotent by construction — every branch ASSIGNS. The gltf is shared
+      // out of the LRU, so a second viewer re-tunes the same material object
+      // and must land on the same value rather than compounding.
+      if (tune.metalness !== undefined) mat.metalness = tune.metalness;
+      const scale = tune.roughness ?? 1;
+      const offset = tune.roughnessOffset ?? 0;
+      if (scale === 1 && offset === 0) return;
+      // `roughness` is a plain multiplier on the map, so the scale rides there;
+      // the offset has no equivalent knob and needs the one line of shader. Both
+      // go through the uniform so every tuned charm still shares one program.
+      mat.roughness = 1;
+      mat.userData.roughAdjust = new THREE.Vector2(scale, offset);
+      mat.onBeforeCompile = (shader) => {
+        shader.uniforms.uRoughAdjust = { value: mat.userData.roughAdjust };
+        shader.fragmentShader = shader.fragmentShader
+          .replace("void main() {", "uniform vec2 uRoughAdjust;\nvoid main() {")
+          .replace(
+            "#include <roughnessmap_fragment>",
+            "#include <roughnessmap_fragment>\n\troughnessFactor = clamp( roughnessFactor * uRoughAdjust.x + uRoughAdjust.y, 0.0, 1.0 );",
+          );
+      };
+      mat.needsUpdate = true;
+    });
   }
 
   /**
@@ -3218,6 +3558,9 @@ async function buildViewer(
         roughness: rough ? 1 : 0.6,
         metalness: 0,
       });
+      // Named after the vmat it was built from, so tuneCharmShading can find it
+      // the same way it finds a material the decompiler wrote.
+      mat.name = material.split("/").pop()!.replace(/\.vmat\.json$/i, "").replace(/_[0-9a-f]{8}$/i, "");
       (mesh.material as import("three").Material)?.dispose?.();
       mesh.material = mat;
     });
@@ -3270,6 +3613,11 @@ async function buildViewer(
      *  floating off it. */
     d: number;
     h: number;
+    /** Hang point → the centre of the charm's bulk, in the sprite's own space.
+     *  A keychain's origin is its RING, so the body hangs below and to one side
+     *  of it; probing contact from the hang point instead of from here floats
+     *  the charm off the weapon by exactly that offset. */
+    off: import("three").Vector3;
   };
   let charm: Charm | null = null;
 
@@ -3684,6 +4032,8 @@ async function buildViewer(
     // lower in the web viewer than in game".
     const ch = CHARM_HEIGHT_M;
     let cw = ch;
+    /** Hang point → centre of the charm's bulk, in the sprite's own space. */
+    let cOff = new THREE.Vector3(0, -ch * 0.5, 0);
     // Flat art has no thickness of its own; give it a token one so the contact
     // radius stays sane on a mount without the models.
     let cd = ch * 0.12;
@@ -3716,6 +4066,17 @@ async function buildViewer(
       sprite = grp;
       cw = size.x * k;
       cd = Math.min(size.x, size.z) * k;
+      // Where the charm's BULK sits relative to the hang point, in group space.
+      //
+      // A keychain's authored origin is its ring, and the body hangs below and
+      // off to one side of it — on Lil' Squatch the model's centre is 7.3mm from
+      // the hang point horizontally. The contact test needs the bulk, not the
+      // ring: probing from the hang point held that point half-a-charm-depth off
+      // the weapon, which floated the whole charm by the difference. Measured
+      // while the group is still at the origin, so this is a pure local offset
+      // and the group's own facing rotation does not contaminate it.
+      grp.updateMatrixWorld(true);
+      cOff = new THREE.Box3().setFromObject(grp).getCenter(new THREE.Vector3());
     } else {
       // Hang by the TOP edge: shift the quad down half its height so the mesh
       // origin sits at the charm's own connector. (A Sprite did this with
@@ -3735,7 +4096,7 @@ async function buildViewer(
     );
     scene.add(line);
     scene.add(sprite);
-    charm = { sprite, line, pivot, pos, prev: pos.clone(), key, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd };
+    charm = { sprite, line, pivot, pos, prev: pos.clone(), key, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd, off: cOff };
     // A tiny initial nudge so it arrives swinging.
     charm.prev.x += sizeL * 0.01;
   }
@@ -3798,13 +4159,13 @@ async function buildViewer(
       // against the body. Half its own depth is what actually touches, and it
       // scales itself to every charm.
       const rC = Math.max(charm.d * 0.5, sizeL * 0.004);
-      // Test from the sprite's visual CENTER (pos is the hang point at the
-      // art's top edge), and never push along the cord — the anchor surface
-      // is supposed to be right there, it isn't a penetration.
-      const cpos = charm.pos.clone();
-      cpos.y -= charm.h * 0.5;
+      // Test from the sprite's visual CENTER (pos is the hang point, up at the
+      // ring), and never push along the cord — the anchor surface is supposed to
+      // be right there, it isn't a penetration. The offset is carried through
+      // the sprite's own rotation, since the group is turned to face the flank.
+      const cpos = charm.pos.clone().add(charm.off.clone().applyQuaternion(charm.sprite.quaternion));
       const toPivot = charm.pivot.clone().sub(cpos).normalize();
-      const collider = charmColliderFor(charm.pivot, CORD_LEN + charm.h * 0.5 + rC);
+      const collider = charmColliderFor(charm.pivot, CORD_LEN + charm.off.length() + rC);
       let best: { nrm: import("three").Vector3; depth: number } | null = null;
       for (const [ax, sign] of [[AXIS_S, 1], [AXIS_S, -1], [AXIS_L, 1], [AXIS_L, -1], [AXIS_H, 1], [AXIS_H, -1]] as [number, number][]) {
         const d = new THREE.Vector3();
@@ -4579,7 +4940,7 @@ async function buildViewer(
   async function mountStatTrak(spec: { count: number | null }) {
     const picked = pickAnchor(STATTRAK_ANCHORS as Record<string, import("./stattrakModule").StatTrakAnchorSet | undefined>, model, !!opts?.legacyPaint);
     if (!picked) return; // no attachment (the C4 has none) — nothing to hang
-    const { anchor, knife } = picked;
+    const { anchor, knife, bone } = picked;
     // Knives are SKIPPED — the module is wired for them but its orientation is
     // unsolved, so enabling it renders a plate stabbed through the blade.
     //
@@ -4670,37 +5031,51 @@ async function buildViewer(
     const xform = stattrakTransform(anchor);
     if (!xform) return;
     const { src, pos, euler } = xform;
-    // POSITION goes through poseXform; ROTATION does not. They are not
-    // symmetric, and treating them as if they were is a regression waiting to
-    // happen — it broke every gun once already.
+    // Which bone actually carries this attachment. Unnamed means "the body",
+    // i.e. exactly what poseXform already is — every gun takes that branch and
+    // nothing about them changes. See StatTrakAnchorSet.bone.
+    const bonePose = (bone ? poseBones.byName.get(bone) : null) ?? poseXform;
+    // POSITION and ROTATION both ride the bone's pose, but they take DIFFERENT
+    // parts of it — treating them as symmetric is a regression waiting to
+    // happen, and it broke every gun once already.
     //
     // Position: `src` is the attachment origin PLUS its parent bone's
-    // model-space position (the attachment hangs off `weapon_offset`, a child
-    // of `weapon`, and `weapon` carries the real offset — 18.23, -0.19, 12.40
-    // on the M4). That lands in bind space, and the body's vertices were baked
-    // through the inventory_icon clip, which translates the weapon to the
+    // model-space position (on a gun the attachment hangs off `weapon_offset`,
+    // a child of `weapon`, and `weapon` carries the real offset — 18.23, -0.19,
+    // 12.40 on the M4). That lands in bind space, and the body's vertices were
+    // baked through the inventory_icon clip, which translates the weapon to the
     // origin (measured: raw geometry spans 1.39..36.77 inches yet the baked box
-    // comes out centred with center ~= 0). poseXform makes the same trip:
+    // comes out centred with center ~= 0). The pose makes the same trip:
     // bind MODEL INCHES -> baked WORLD metres. No `center` correction —
     // object.position applies -center to geometry and module alike.
-    if (poseXform) {
-      mod.position.set(src[0], src[1], src[2]).applyMatrix4(poseXform);
+    if (bonePose) {
+      mod.position.set(src[0], src[1], src[2]).applyMatrix4(bonePose);
     } else {
       mod.position.set(pos[0], pos[1], pos[2]);
     }
-    // Rotation must NOT come from poseXform. That matrix carries the glb node
-    // matrix (the model->world axis swizzle), and the module's OWN glb node
-    // already applies the identical swizzle — taking the rotation from it
+    // Rotation must NOT be the pose's rotation WHOLE. That matrix carries the
+    // glb node matrix (the model->world axis swizzle), and the module's OWN glb
+    // node already applies the identical swizzle — taking the rotation from it
     // applies the swap twice and stands the module on end. On the M4, whose
     // anchor angles are exactly [0,0,0], that turned a correct horizontal
     // readout into a vertical black bar.
     //
-    // So the tilt is the attachment's own angles, swizzled to match the
-    // position (glb x,y,z = model y,z,x). Every GUN anchor is unrotated, so
-    // this is effectively identity for them and the convention is unconstrained
-    // by guns — which is exactly why knives (karambit [-54.1, 0, -170.4]) do
-    // not work yet and stay gated above.
-    mod.quaternion.setFromEuler(new THREE.Euler(euler[1], euler[2], euler[0], "ZYX"));
+    // Divide the swizzle out and what is left is the rotation the CLIP applied,
+    // which the module does have to share: it is bolted to the gun, so if the
+    // pose turns the gun the module turns with it. On guns that residual
+    // measures 0.05-0.09 degrees — the pose is a pure translation and this stays
+    // the no-op it has always been. On the elite's `weapon_r` it is 65 degrees,
+    // and without it the module hangs beside the pistol at a visibly wrong
+    // angle.
+    //
+    // Onto that goes the attachment's own tilt, swizzled to match the position
+    // (glb x,y,z = model y,z,x). Every GUN anchor is unrotated, so that half is
+    // unconstrained by guns — which is exactly why knives (karambit
+    // [-54.1, 0, -170.4]) do not work yet and stay gated above.
+    const clipQuat = clipRotation(THREE, bonePose, poseBones.modelQuat) ?? new THREE.Quaternion();
+    mod.quaternion
+      .copy(clipQuat)
+      .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(euler[1], euler[2], euler[0], "ZYX")));
 
     // ---- Seat it against the body -------------------------------------------
     // The anchor is validated (muzzle_flash lands 2cm past the barrel on a 90cm
@@ -4898,7 +5273,7 @@ async function buildViewer(
           `  worst ${stickerCost.worst.toFixed(1)}ms  tri ${stickerCost.rebuilds ? Math.round(stickerCost.outTris / stickerCost.rebuilds) : 0}` +
           `  miss ${stickerCost.pickMiss}\n`
         : "") +
-      `bakes ${liveViewers > 0 ? "held" : "free"}${snapshotsInFlight ? `  IN FLIGHT ${snapshotsInFlight}` : ""}`;
+      `bakes ${liveViewers > 0 ? "held" : idleTimer ? "settling" : "free"}${snapshotsInFlight ? `  IN FLIGHT ${snapshotsInFlight}` : ""}`;
     acc.frames = 0;
     acc.total = acc.ctrl = acc.charm = acc.draw = acc.worst = 0;
     acc.since = tEnd;
@@ -4910,7 +5285,16 @@ async function buildViewer(
   // the graph — instead of being guessed at one rebuild-and-reload at a time.
   // Absent from a normal session.
   if (STICKER_LOG && !opts?.still) {
-    (window as unknown as { __viewer?: unknown }).__viewer = { THREE, scene, camera, object, decals: liveMesh, uv1Meshes };
+    // `charm` is a getter: the object is rebuilt whenever the charm changes, so
+    // a snapshot taken at mount would go stale and quietly report the previous
+    // charm's pivot. Its pivot/pos are the only way to see where the hang point
+    // actually is — every gap question is "pivot vs the model's own top".
+    (window as unknown as { __viewer?: unknown }).__viewer = {
+      THREE, scene, camera, object, decals: liveMesh, uv1Meshes, weaponMeshes,
+      get charm() {
+        return charm;
+      },
+    };
   }
 
   let raf = 0;
@@ -4977,7 +5361,9 @@ async function buildViewer(
     camera.updateProjectionMatrix();
     // The pan's view offset is stated in the OLD viewport's pixels — re-apply it
     // against the new size, which also re-clamps it so a shrink cannot strand
-    // the weapon off-frame.
+    // the weapon off-frame. Forced, because the offset has to be restated for
+    // the new dimensions even when the pan itself has not moved.
+    panApplied.set(NaN, NaN);
     applyPan();
   };
   // If the browser drops the context (mobile Safari sheds the oldest one when
@@ -5009,7 +5395,13 @@ async function buildViewer(
   // Only onscreen viewers hold back background bakes — a `still` viewer IS a
   // bake, and counting it would deadlock the queue against itself.
   let released = !!opts?.still;
-  if (!released) liveViewers++;
+  if (!released) {
+    liveViewers++;
+    // Cancel any in-flight settle: the user came back inside the window, so the
+    // wait restarts rather than expiring under a viewer that is now onscreen.
+    clearTimeout(idleTimer);
+    idleTimer = undefined;
+  }
   // dispose() can follow a context-loss teardown, so the release must latch.
   const release = () => {
     if (released) return;
