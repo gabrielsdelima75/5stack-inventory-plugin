@@ -3392,7 +3392,19 @@ function measureSheetScroll(el: HTMLElement | null) {
   const offscreen = isCompact.value ? sheetTranslate.value : 0;
   sheetHasMore.value = el.scrollHeight - el.scrollTop - el.clientHeight + offscreen > 8;
 }
-const onSheetScroll = (e: Event) => measureSheetScroll(e.target as HTMLElement);
+// Same per-frame coalescing as scrollFade, and for the same reason: the three
+// reads in measureSheetScroll are layout reads on a scroller that can fire
+// several events per paint.
+let sheetScrollPending = false;
+const onSheetScroll = (e: Event) => {
+  const el = e.target as HTMLElement;
+  if (sheetScrollPending) return;
+  sheetScrollPending = true;
+  requestAnimationFrame(() => {
+    sheetScrollPending = false;
+    measureSheetScroll(el);
+  });
+};
 // Function ref rather than a plain one: the scroller is keyed on
 // mode|weapon inside an out-in Transition, so it is destroyed and rebuilt on
 // every mode switch and a static ref would go stale. Measured on the next frame
@@ -3428,11 +3440,24 @@ function scrollFade() {
   const more = ref(false);
   let el: HTMLElement | null = null;
   const measure = () => (more.value = !!el && el.scrollHeight - el.scrollTop - el.clientHeight > 8);
+  // Coalesced to one measurement per frame. `scrollHeight`/`clientHeight` are
+  // layout reads, and a scroll event can fire many times between paints — on a
+  // long inventory grid that is a forced reflow per event for a boolean that
+  // can only change once per frame anyway.
+  let pending = false;
+  const measureSoon = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      measure();
+    });
+  };
   return {
     more,
     onScroll: (e: Event) => {
       el = e.target as HTMLElement;
-      measure();
+      measureSoon();
     },
     /**
      * Function ref for the WRAPPER, which then finds the scroller inside it by
